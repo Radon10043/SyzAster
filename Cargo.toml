@@ -1,0 +1,30 @@
+[package]
+name = "syzaster"
+version = "0.1.0"
+edition = "2021"
+description = "SyzAster: Coverage-Guided Kernel Fuzzing Prototype Tool for Asterinas Framekernel"
+license = "Apache-2.0 AND MPL-2.0"
+
+[lib]
+name = "syzaster"
+path = "src/lib.rs"
+
+[[bin]]
+name = "syzaster"
+path = "src/bin/syzaster.rs"
+
+[[bin]]
+name = "check-asterinas-kcov"
+path = "src/bin/check-asterinas-kcov.rs"
+
+[[bin]]
+name = "check-kcov-inst"
+path = "src/bin/check-kcov-inst.rs"
+
+[[bin]]
+name = "kcov-rustc"
+path = "src/bin/kcov-rustc.rs"
+
+[[bin]]
+name = "eval-fuzz"
+path = "src/bin/eval-fuzz.rs"
