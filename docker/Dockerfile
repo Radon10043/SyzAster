@@ -41,12 +41,12 @@ RUN mkdir -p /usr/share/qemu && \
     fi
 
 # Install Go 1.26.3 (required by syzkaller)
-RUN wget -q https://go.dev/dl/go1.26.3.linux-amd64.tar.gz && \
+RUN wget -q --show-progress --progress=bar:force:noscroll https://go.dev/dl/go1.26.3.linux-amd64.tar.gz && \
     tar -C /usr/local -xzf go1.26.3.linux-amd64.tar.gz && \
     rm go1.26.3.linux-amd64.tar.gz
 
 # Install FlatBuffers 23.5.26 (required by syzkaller RPC)
-RUN wget -q https://github.com/google/flatbuffers/archive/refs/tags/v23.5.26.tar.gz && \
+RUN wget -q --show-progress --progress=bar:force:noscroll https://github.com/google/flatbuffers/archive/refs/tags/v23.5.26.tar.gz && \
     tar -xzf v23.5.26.tar.gz && \
     pushd flatbuffers-23.5.26 && \
     cmake -G "Unix Makefiles" && \
@@ -56,7 +56,7 @@ RUN wget -q https://github.com/google/flatbuffers/archive/refs/tags/v23.5.26.tar
     rm -rf v23.5.26.tar.gz flatbuffers-23.5.26
 
 # Install LLVM 19
-RUN wget -q https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz && \
+RUN wget -q --show-progress --progress=bar:force:noscroll https://github.com/llvm/llvm-project/releases/download/llvmorg-19.1.7/LLVM-19.1.7-Linux-X64.tar.xz && \
     mkdir /llvm-19 && \
     tar -C /llvm-19 -xf LLVM-19.1.7-Linux-X64.tar.xz --strip-components=1 && \
     rm LLVM-19.1.7-Linux-X64.tar.xz
@@ -74,7 +74,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     rm -rf /root/.cargo/registry /root/.cargo/git
 
 # Download Linux VDSO library required for building Asterinas
-RUN git clone https://github.com/asterinas/linux_vdso.git /root/linux_vdso && \
+RUN git clone --progress https://github.com/asterinas/linux_vdso.git /root/linux_vdso && \
     git -C /root/linux_vdso checkout 8af5717
 
 # Install Nix and nixos-install-tools (pinned to NixOS 26.05 matching distro/nixpkgs.nix)
@@ -88,6 +88,6 @@ RUN mkdir -p /etc/nix && \
     nix-env -iA nixpkgs.nixos-install-tools
 
 # Install fzf and lazygit for interactive debugging
-RUN git clone --depth 1 https://github.com/junegunn/fzf.git /root/.fzf && \
+RUN git clone --progress --depth 1 https://github.com/junegunn/fzf.git /root/.fzf && \
     yes | /root/.fzf/install
 RUN go install github.com/jesseduffield/lazygit@latest
