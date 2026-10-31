@@ -1,0 +1,46 @@
+#############################
+### General configuration ###
+#############################
+x-base: &base
+  image: syzaster:latest
+  privileged: true
+  cpus: ${EXPERIMENT_CPUS}
+  tmpfs:
+    - /tmp
+    - /var/tmp
+  environment: &env
+    TMPDIR: /tmp
+    VMCOUNT: ${EXPERIMENT_VMCOUNT}
+    SYZASTER: ${EXPERIMENT_ROOT_CONTAINER}/fuzzer/SyzAster
+    SYZKALLER: ${EXPERIMENT_ROOT_CONTAINER}/fuzzer/SyzAster/syzkaller
+    OUTROOT: ${EXPERIMENT_ROOT_CONTAINER}/experiment/SyzAster-nocover
+  volumes:
+    - /etc/timezone:/etc/timezone:ro
+    - /etc/localtime:/etc/localtime:ro
+    - ${EXPERIMENT_ROOT_HOST:?EXPERIMENT_ROOT_HOST is required}:${EXPERIMENT_ROOT_CONTAINER:?EXPERIMENT_ROOT_CONTAINER is required}
+
+####################
+### Project name ###
+####################
+name: syzaster-nocover
+
+services:
+
+  asterinas-v0.18.1-kernel:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/asterinas-v0.18.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.1-nocover
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.1"
+      SUBSYSTEM: kernel
+    command:
+      - bash
+      - -ceu
+      - |
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/nocover.cfg" > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 24h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1

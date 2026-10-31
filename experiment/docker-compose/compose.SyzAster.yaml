@@ -1,0 +1,134 @@
+#############################
+### General configuration ###
+#############################
+x-base: &base
+  image: syzaster:latest
+  privileged: true
+  cpus: ${EXPERIMENT_CPUS}
+  tmpfs:
+    - /tmp
+    - /var/tmp
+  environment: &env
+    TMPDIR: /tmp
+    VMCOUNT: ${EXPERIMENT_VMCOUNT}
+    SYZASTER: ${EXPERIMENT_ROOT_CONTAINER}/fuzzer/SyzAster
+    SYZKALLER: ${EXPERIMENT_ROOT_CONTAINER}/fuzzer/SyzAster/syzkaller
+    OUTROOT: ${EXPERIMENT_ROOT_CONTAINER}/experiment/SyzAster
+  volumes:
+    - /etc/timezone:/etc/timezone:ro
+    - /etc/localtime:/etc/localtime:ro
+    - ${EXPERIMENT_ROOT_HOST:?EXPERIMENT_ROOT_HOST is required}:${EXPERIMENT_ROOT_CONTAINER:?EXPERIMENT_ROOT_CONTAINER is required}
+
+####################
+### Project name ###
+####################
+name: syzaster
+
+services:
+
+###############
+### Kernels ###
+###############
+
+  asterinas-v0.18.1-kernel:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/asterinas-v0.18.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.1
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.1"
+      SUBSYSTEM: kernel
+    command:
+      - bash
+      - -ceu
+      - |
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 24h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+##################
+### Subsystems ###
+##################
+
+  asterinas-v0.18.1-fs:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/asterinas-v0.18.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.1
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.1"
+      SUBSYSTEM: fs
+    command:
+      - bash
+      - -ceu
+      - |
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
+        jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+  asterinas-v0.18.1-net:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/asterinas-v0.18.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.1
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.1"
+      SUBSYSTEM: net
+    command:
+      - bash
+      - -ceu
+      - |
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
+        jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+  asterinas-v0.18.1-process:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/asterinas-v0.18.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.1
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.1"
+      SUBSYSTEM: process
+    command:
+      - bash
+      - -ceu
+      - |
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
+        jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+  asterinas-v0.18.1-mm:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/asterinas-v0.18.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.1
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.1"
+      SUBSYSTEM: mm
+    command:
+      - bash
+      - -ceu
+      - |
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
+        jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
