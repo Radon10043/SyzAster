@@ -7,6 +7,7 @@
 % 此处仅补充正文所需的宏包、环境与命令，不修改页面、字体、标题等样式。
 % ---------------------------------------------------------------
 \usepackage{tabularx}
+\usepackage{xurl}  % 允许 URL 在任意字符处断行，避免溢出页边
 \graphicspath{{images/}}
 
 % 代码：仅定义 Rust 语言，样式沿用模板默认的 lstlisting 设置
@@ -69,7 +70,7 @@
 \author{张家铭}
 \institute{北京科技大学\quad RustTrace\\[2pt]
   项目开源仓库：\url{https://github.com/Radon10043/SyzAster}}
-\version{9ed0da61f273f54f77fdcd4dda126dc366a1bb45}
+\version{d298414ecd319565231f4d2ab4aea1da36bc20ab}
 \date{2026 年 10 月}
 
 \addbibresource[location=local]{refs.bib}
@@ -299,7 +300,7 @@ fn record(&self, pc: usize) {
 （2）\emph{使用范围}：辅助编写单元测试代码、润色文本表达等；
 （3）\emph{审查与真实性}：所有代码与文档均经过队员多次严格人工审查。
 
-本参赛项目完全秉持开源精神，源码遵从 Apache-2.0 与 MPL-2.0 开源许可证，开源托管于 GitHub：\url{https://github.com/Radon10043/SyzAster}。全部提交内容不存在抄袭、代做或数据伪造。
+本参赛项目秉持开源精神，代码仓库 \url{https://github.com/Radon10043/SyzAster} 在 GitHub 上公开托管。其中，自研代码采用 MIT 许可证，文档（含本报告）采用 CC BY-SA 4.0 许可证，\aster{} 与 \syz{} 补丁分别遵循上游项目的 MPL-2.0 与 Apache-2.0 许可证。全部提交内容不存在抄袭、代做或数据伪造。
 
 \printbibliography[heading=bibintoc, title=参考文献]
 
