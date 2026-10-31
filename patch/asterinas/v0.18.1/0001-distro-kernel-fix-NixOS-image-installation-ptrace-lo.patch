@@ -1,4 +1,4 @@
-From c37878c5fc7478e9faf7f1fa3554da0e98702863 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: SyzAster Authors <syzaster@asterinas.org>
 Date: Sat, 31 Oct 2026 10:54:43 +0800
 Subject: [PATCH 1/2] distro, kernel: fix NixOS image installation, ptrace

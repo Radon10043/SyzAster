@@ -1,4 +1,4 @@
-From b563e6038143ccfcfae2660fccba21285309202e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Jiaming Zhang <772577952@qq.com>
 Date: Sat, 31 Oct 2026 14:29:58 +0800
 Subject: [PATCH] pkg, syz-manager, vm: add adaptive snapshot restoration with

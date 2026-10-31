@@ -1,4 +1,4 @@
-From e2bdf63d5a254454d6a3646a65627f69be2ac2dc Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: SyzAster Authors <syzaster@asterinas.org>
 Date: Sat, 31 Oct 2026 10:54:17 +0800
 Subject: [PATCH 3/4] pkg/report: parse Asterinas uncaught kernel panics

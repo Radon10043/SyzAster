@@ -1,4 +1,4 @@
-From ea59ae52e7b43b89caea5238c51c26adff99ded7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: SyzAster Authors <syzaster@asterinas.org>
 Date: Sat, 31 Oct 2026 10:54:17 +0800
 Subject: [PATCH 4/4] docs, pkg/mgrconfig: add Asterinas QEMU config fixture

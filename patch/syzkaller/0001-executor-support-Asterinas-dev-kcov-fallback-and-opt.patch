@@ -1,4 +1,4 @@
-From c97c082a76132357ffbdf14ca0666040f47f6156 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: SyzAster Authors <syzaster@asterinas.org>
 Date: Sat, 31 Oct 2026 10:54:17 +0800
 Subject: [PATCH 1/4] executor: support Asterinas /dev/kcov fallback and
