@@ -1,0 +1,114 @@
+<mxfile host="65bd71144e">
+    <diagram id="syzaster-arch" name="SyzAster Architecture">
+        <mxGraphModel dx="1422" dy="489" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="820" pageHeight="600" math="0" shadow="0">
+            <root>
+                <mxCell id="0"/>
+                <mxCell id="1" parent="0"/>
+                <mxCell id="host" parent="1" style="rounded=1;arcSize=3;whiteSpace=wrap;html=1;dashed=1;dashPattern=6 3;strokeWidth=1.2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=2;fontFamily=Noto Serif CJK SC;fontSize=13;fontStyle=1;" value="宿主机" vertex="1">
+                    <mxGeometry height="205" width="780" x="20" y="20" as="geometry"/>
+                </mxCell>
+                <mxCell id="guest" parent="1" style="rounded=1;arcSize=3;whiteSpace=wrap;html=1;dashed=1;dashPattern=6 3;strokeWidth=1.2;verticalAlign=top;align=left;spacingLeft=10;spacingTop=2;fontFamily=Noto Serif CJK SC;fontSize=13;fontStyle=1;" value="目标机（Asterinas，&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;KCOV=1&lt;/font&gt;）" vertex="1">
+                    <mxGeometry height="280" width="780" x="20" y="265" as="geometry"/>
+                </mxCell>
+                <mxCell id="rustc" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F5E6E6;strokeColor=#800000;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;kcov-rustc&lt;/b&gt;&lt;/font&gt;&lt;br&gt;选择性插桩器" vertex="1">
+                    <mxGeometry height="48" width="165" x="40" y="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="inst" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F5E6E6;strokeColor=#800000;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;check-kcov-inst&lt;/b&gt;&lt;/font&gt;&lt;br&gt;插桩边界校验" vertex="1">
+                    <mxGeometry height="48" width="165" x="225" y="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="abi" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F5E6E6;strokeColor=#800000;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;check-asterinas-kcov&lt;/b&gt;&lt;/font&gt;&lt;br&gt;kcov ABI 校验" vertex="1">
+                    <mxGeometry height="48" width="190" x="410" y="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="eval" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F5E6E6;strokeColor=#800000;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;eval-fuzz&lt;/b&gt;&lt;/font&gt;&lt;br&gt;统计评估" vertex="1">
+                    <mxGeometry height="48" width="160" x="620" y="55" as="geometry"/>
+                </mxCell>
+                <mxCell id="img" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#555555;strokeWidth=1;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;create-image.sh&lt;/font&gt;&lt;br&gt;NixOS 镜像 + vmlinux" vertex="1">
+                    <mxGeometry height="50" width="165" x="40" y="155" as="geometry"/>
+                </mxCell>
+                <mxCell id="mgr" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EAF0F7;strokeColor=#1F4E79;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;syz-manager&lt;/b&gt;&lt;/font&gt;&lt;br&gt;符号与 panic 解析 · 自适应生命周期管理" vertex="1">
+                    <mxGeometry height="50" width="320" x="255" y="155" as="geometry"/>
+                </mxCell>
+                <mxCell id="out" parent="1" style="shape=cylinder3;boundedLbl=1;size=7;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#555555;strokeWidth=1;fontFamily=Noto Serif CJK SC;fontSize=12;" value="语料库 / 崩溃&lt;br&gt;工作目录" vertex="1">
+                    <mxGeometry height="60" width="120" x="640" y="150" as="geometry"/>
+                </mxCell>
+                <mxCell id="exec" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EAF0F7;strokeColor=#1F4E79;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;syz-executor&lt;/b&gt;&lt;/font&gt;&lt;br&gt;打开 &lt;font face=&quot;DejaVu Sans Mono&quot;&gt;/dev/kcov&lt;/font&gt;" vertex="1">
+                    <mxGeometry height="50" width="320" x="255" y="300" as="geometry"/>
+                </mxCell>
+                <mxCell id="core" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#F5E6E6;strokeColor=#800000;strokeWidth=1.4;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;&lt;b&gt;aster_core&lt;/b&gt;&lt;/font&gt;（安全 Rust，SanitizerCoverage 插桩）&lt;br&gt;系统调用 · VFS · 进程 · 网络 · 内存映射　　&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;/dev/kcov&lt;/font&gt; 设备 · &lt;font face=&quot;DejaVu Sans Mono&quot;&gt;/proc/kallsyms&lt;/font&gt;" vertex="1">
+                    <mxGeometry height="54" width="600" x="115" y="386" as="geometry"/>
+                </mxCell>
+                <mxCell id="ostd" parent="1" style="rounded=1;arcSize=8;whiteSpace=wrap;html=1;fillColor=#E3E3E3;strokeColor=#333333;strokeWidth=1.6;fontFamily=Noto Serif CJK SC;fontSize=12;" value="&lt;b&gt;OSTD&lt;/b&gt;（可信计算基，不插桩）&lt;br&gt;&lt;font face=&quot;DejaVu Sans Mono&quot;&gt;ostd::kcov&lt;/font&gt;：裸函数跳板 &lt;font face=&quot;DejaVu Sans Mono&quot;&gt;__sanitizer_cov_trace_pc&lt;/font&gt; → &lt;font face=&quot;DejaVu Sans Mono&quot;&gt;record_pc&lt;/font&gt; → &lt;font face=&quot;DejaVu Sans Mono&quot;&gt;KcovBuffer&lt;/font&gt;" vertex="1">
+                    <mxGeometry height="54" width="600" x="115" y="475" as="geometry"/>
+                </mxCell>
+                <mxCell id="e1" edge="1" parent="1" source="rustc" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;fontFamily=Noto Serif CJK SC;fontSize=10;labelBackgroundColor=none;" target="img" value="&lt;font style=&quot;font-size: 12px;&quot;&gt;构建时注入&lt;/font&gt;">
+                    <mxGeometry relative="1" x="0.0385" y="38" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e2" edge="1" parent="1" source="rustc" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;dashed=1;strokeWidth=1.2;strokeColor=#800000;fontFamily=Noto Serif CJK SC;fontSize=9;labelBackgroundColor=none;verticalAlign=bottom;" target="inst" value="">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e3" edge="1" parent="1" source="img" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;" target="mgr">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e4" edge="1" parent="1" source="mgr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;" target="out">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e5" edge="1" parent="1" source="out" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;" target="eval">
+                    <mxGeometry relative="1" as="geometry"/>
+                </mxCell>
+                <mxCell id="e6" edge="1" parent="1" source="mgr" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;fontFamily=Noto Serif CJK SC;fontSize=12;labelBackgroundColor=#FFFFFF;" target="exec" value="&amp;nbsp;ssh / rpc 调度">
+                    <mxGeometry relative="1" x="-0.2632" y="45" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e7" edge="1" parent="1" source="exec" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;fontFamily=Noto Serif CJK SC;fontSize=10;labelBackgroundColor=#FCF7F7;" target="core" value="系统调用">
+                    <mxGeometry relative="1" x="-0.4444" y="25" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e8" edge="1" parent="1" source="core" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.3;strokeColor=#333333;fontFamily=Noto Serif CJK SC;fontSize=10;labelBackgroundColor=#FCF7F7;" target="ostd" value="回调">
+                    <mxGeometry relative="1" x="-0.4286" y="15" as="geometry">
+                        <mxPoint as="offset"/>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e9" edge="1" parent="1" source="ostd" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;dashed=1;strokeWidth=1.3;strokeColor=#000000;fontFamily=Noto Serif CJK SC;fontSize=12;fontColor=#000000;labelBackgroundColor=none;exitX=0;exitY=0.5;entryX=0;entryY=0.5;" target="exec" value="共享 VMO&lt;br&gt;PC 记录">
+                    <mxGeometry relative="1" x="0.2566" y="-25" as="geometry">
+                        <mxPoint as="offset"/>
+                        <Array as="points">
+                            <mxPoint x="65" y="502"/>
+                            <mxPoint x="65" y="325"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="e10" edge="1" parent="1" source="abi" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;dashed=1;strokeWidth=1.2;strokeColor=#000000;fontFamily=Noto Serif CJK SC;fontSize=12;fontColor=#000000;labelBackgroundColor=#FFFFFF;exitX=0.95;exitY=1;entryX=0.75;entryY=0;entryDx=0;entryDy=0;textShadow=0;" target="exec" value="运行期 ABI 验证">
+                    <mxGeometry relative="1" x="-0.0632" y="50" as="geometry">
+                        <mxPoint as="offset"/>
+                        <Array as="points">
+                            <mxPoint x="590.5" y="250"/>
+                            <mxPoint x="495" y="250"/>
+                        </Array>
+                    </mxGeometry>
+                </mxCell>
+                <mxCell id="lg1" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#F5E6E6;strokeColor=#800000;strokeWidth=1.4;" value="" vertex="1">
+                    <mxGeometry height="13" width="22" x="190" y="558" as="geometry"/>
+                </mxCell>
+                <mxCell id="lg1t" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Noto Serif CJK SC;fontSize=11;" value="SyzAster 的 Rust 组件" vertex="1">
+                    <mxGeometry height="20" width="150" x="217" y="554" as="geometry"/>
+                </mxCell>
+                <mxCell id="lg2" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#EAF0F7;strokeColor=#1F4E79;strokeWidth=1.4;" value="" vertex="1">
+                    <mxGeometry height="13" width="22" x="375" y="558" as="geometry"/>
+                </mxCell>
+                <mxCell id="lg2t" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Noto Serif CJK SC;fontSize=11;" value="syzkaller 适配组件" vertex="1">
+                    <mxGeometry height="20" width="170" x="402" y="554" as="geometry"/>
+                </mxCell>
+                <mxCell id="lg3" parent="1" style="rounded=1;arcSize=10;whiteSpace=wrap;html=1;fillColor=#E3E3E3;strokeColor=#333333;strokeWidth=1.6;" value="" vertex="1">
+                    <mxGeometry height="13" width="22" x="580" y="558" as="geometry"/>
+                </mxCell>
+                <mxCell id="lg3t" parent="1" style="text;html=1;align=left;verticalAlign=middle;fontFamily=Noto Serif CJK SC;fontSize=11;" value="可信计算基（TCB）" vertex="1">
+                    <mxGeometry height="20" width="120" x="607" y="554" as="geometry"/>
+                </mxCell>
+            </root>
+        </mxGraphModel>
+    </diagram>
+</mxfile>

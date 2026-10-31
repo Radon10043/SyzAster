@@ -1,0 +1,306 @@
+% SyzAster 参赛技术报告（2026 Rust 软件原型开发竞赛）
+% 排版采用 ElegantPaper 模板默认风格
+\documentclass[lang=cn,11pt,a4paper,chinesefont=ctexfont]{elegantpaper}
+
+% ---------------------------------------------------------------
+% 导言区：排版完全沿用 elegantpaper.cls 默认风格，
+% 此处仅补充正文所需的宏包、环境与命令，不修改页面、字体、标题等样式。
+% ---------------------------------------------------------------
+\usepackage{tabularx}
+\graphicspath{{images/}}
+
+% 代码：仅定义 Rust 语言，样式沿用模板默认的 lstlisting 设置
+\lstdefinelanguage{Rust}{
+  keywords={as,break,const,continue,crate,else,enum,extern,false,fn,for,if,impl,in,
+    let,loop,match,mod,move,mut,pub,ref,return,self,Self,static,struct,super,trait,
+    true,type,unsafe,use,where,while,dyn},
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  string=[b]",
+}
+\lstset{language=Rust}
+\renewcommand{\lstlistingname}{代码}
+
+% 快捷命令
+% \code{}：等宽字体，且允许在任意字符之间断行（参考 SyzPilot 论文的定义）。
+% 先按空格切分单词以保留空格，再在每个字符后插入 \allowbreak；
+% 声明为 robust 以便用于章节标题与图表标题，书签中退化为纯文本。
+\makeatletter
+\DeclareRobustCommand{\code}[1]{%
+  \begingroup
+  \ttfamily
+  \def\_{\char`\_\allowbreak}%
+  \def\${\char`\$\allowbreak}%
+  \@code@words#1 \@code@end
+  \endgroup
+}
+\def\@code@words#1 #2\@code@end{%
+  \@code@breakseq#1\@nil
+  \if\relax\detokenize{#2}\relax
+    \expandafter\@gobble
+  \else
+    \ \allowbreak
+    \expandafter\@firstofone
+  \fi
+  {\@code@words#2\@code@end}%
+}
+\def\@code@breakseq#1{%
+  \ifx#1\@nil\else
+    #1\allowbreak
+    \expandafter\@code@breakseq
+  \fi
+}
+\makeatother
+\pdfstringdefDisableCommands{\def\code#1{#1}}
+\newcommand{\tool}[1]{#1}
+\newcommand{\syz}{syzkaller}
+\newcommand{\aster}{Asterinas}
+\newcommand{\sa}{SyzAster}
+\newcommand{\TBD}[1]{#1}
+
+% 参考文献中长英文书名难以断行，放宽其换行容差以避免溢出页边
+\AtBeginBibliography{\sloppy}
+
+% ---------------------------------------------------------------
+% 论文元信息与参赛信息
+% ---------------------------------------------------------------
+\title{SyzAster：面向 \aster{} 框内核的覆盖制导内核模糊测试原型工具}
+\author{张家铭}
+\institute{北京科技大学\quad RustTrace\\[2pt]
+  项目开源仓库：\url{https://github.com/Radon10043/SyzAster}}
+\version{9ed0da61f273f54f77fdcd4dda126dc366a1bb45}
+\date{2026 年 10 月}
+
+\addbibresource[location=local]{refs.bib}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\aster{} 是一款以 Rust 编写、与 Linux ABI 兼容的框内核（framekernel）操作系统。它把全部 \code{unsafe} 代码限制在操作系统标准库 OSTD 这一极小的可信计算基中，其余内核服务均以安全 Rust 实现。Rust 的类型系统能够消除绝大部分内存安全问题，但无法阻止如 \code{panic!} 引发的内核拒绝服务、死锁以及系统调用语义偏差等问题。以 \syz{} 为代表的系统调用级覆盖制导模糊测试是发现此类问题最有效的手段之一，然而 \syz{} 依赖 Linux 的全局插桩、\code{debugfs}/kcov 接口及 Oops 报告格式，无法直接用于 \aster{}。
+
+本项目研发了 \sa{} -- 面向 \aster{} 框内核的覆盖制导内核模糊测试工具。\sa{} 的主要贡献包括两点：（1）面向框内核的覆盖制导灰盒模糊测试：仅对安全服务层 \code{aster\_core} 插桩，不插桩 OSTD，并以 Rust 实现覆盖收集工具以及与 Linux 兼容的相关系统调用处理逻辑，使 \syz{} 能在 \aster{} 上获取覆盖率反馈并对检测到的问题去重；（2）自适应内核生命周期管理：基于上下文多臂老虎机（Linear UCB）在快照恢复与完整重启之间自适应决策，降低被测内核的重启开销。
+
+\sa{} 对 \syz{} 与 \aster{} 所做的全部改进均已通过二者的全部单元测试。此外，\sa{} 已能在 QEMU 中运行插桩的 \aster{} 内核与 NixOS 用户态系统，开展覆盖制导模糊测试。
+
+\keywords{Rust；框内核；\aster{}；内核模糊测试；内核生命周期管理}
+\end{abstract}
+
+\section{项目简介}\label{sec:intro}
+
+\sa{} 是一个面向 \aster{}~\cite{asterinas,Peng2025Asterinas} 框内核的覆盖制导内核模糊测试工具。它基于 Google 的 \syz{}~\cite{syzkaller} 实现，与一套专门的 Rust 组件协同工作。这些组件涵盖内核侧覆盖信息收集、插桩和构建校验等。项目提供从``补丁应用、内核插桩与构建、制作 NixOS 镜像、启动模糊测试''到``崩溃分诊、复现、统计评估''的完整流程。项目的核心构成分为两部分：
+\begin{itemize}[leftmargin=*]
+  \item \emph{面向 \aster{} 的框内核的覆盖收集}：在不破坏可信计算基（TCB）完整性的前提下，仅对安全服务层实施插桩，并在 OSTD 中以 Rust 实现覆盖信息收集，向用户态提供与 Linux 兼容的覆盖信息与内核符号接口，为框内核提供支撑覆盖制导模糊测试的基础。
+  \item \emph{面向 Rust 框内核的 \syz{} 适配与优化}：一方面使 \syz{} 的执行器、符号解析与崩溃分析适配 \aster{} 的接口形态和 Rust panic 报告格式，实现覆盖反馈与崩溃去重；另一方面将内核生命周期管理建模为上下文多臂老虎机问题，在快照恢复与完整重启之间自适应决策，以提高内核测试效率。
+\end{itemize}
+
+\sa{} 中的 Rust 承担了两类核心职责：（1）\emph{内核覆盖收集器用 Rust 写在框内核的可信计算基内}，其实现正确性决定了模糊测试能否被覆盖所引导；（2）\emph{插桩策略与校验逻辑由 Rust 工具实现}，并借助所有权机制自动释放临时资源、借助切片类型的边界检查安全解析 ELF 文件。
+
+\section{研发背景}\label{sec:background}
+
+\subsection{Rust 操作系统内核}
+
+Linux 等宏内核中相当一部分安全问题源自 C/C++ 语言的内存不安全。
+用 Rust 编写操作系统内核，借助所有权、借用检查和类型系统在编译期消除悬空指针、数据竞争与越界访问，受到系统软件学术界与工业界的青睐。
+\aster{}~\cite{asterinas,Peng2025Asterinas} 创新性地提出了\emph{框内核}（framekernel）架构 -- 整个操作系统内核运行在同一地址空间中，以保留单体宏内核的高性能；
+同时，内核被严格划分为两层，即仅包含底层硬件抽象、页表、中断、自旋锁等 \code{unsafe} 代码的最小可信计算基 \emph{OSTD}，以及只允许使用安全 Rust 实现的操作系统服务层 \emph{\code{aster\_core}}。
+在该架构下，只要 OSTD 的形式化或严谨性得到保证，上层所有系统服务的空间与时间内存安全便能完全由 Rust 编译器静态保障。
+
+然而，内存安全并不等同于系统正确性。对于 \aster{} 这种目标是完全兼容 Linux ABI 的内核而言，以下四类问题依然普遍存在且无法依靠编译器类型系统预防：
+\begin{enumerate}
+  \item \emph{内核崩溃（Kernel Panic）}：Rust 采用显式异常终止机制。\code{unwrap()}、\code{expect()}、断言失败（\code{assert!}）、未实现标记（\code{unimplemented!}）以及调试构建中的算术溢出检查，在不可信用户空间构造的异常参数下会直接引发整个内核 panic，造成本地拒绝服务（DoS）；
+  \item \emph{并发与锁顺序问题}：安全 Rust 能消除数据竞争，但无法阻止多个自旋锁或读写锁嵌套引起的死锁；
+  \item \emph{POSIX 规范与系统调用语义偏差}：与 Linux 语义的细微不一致可能破坏用户态核心基础服务（如 systemd），甚至导致安全凭据检查绕过；
+  \item \emph{跨越 TCB 边界的逻辑穿透}：安全服务层通过 OSTD 暴露的 trait 接口调用底层时，异常输入组合可能触发 TCB 内部的非预期行为。
+\end{enumerate}
+这类问题只能在运行时由特定的系统调用序列触发，需要借助动态测试手段系统地发掘。
+
+\subsection{syzkaller}
+
+\syz{}~\cite{syzkaller} 是 Google 开发的系统调用级覆盖制导内核模糊测试工具，已在 Linux、FreeBSD 等内核上发现并推动修复了数千个真实问题~\cite{syzbot}。
+它以 syzlang 描述系统调用的参数类型与调用间依赖，据此生成并变异系统调用序列；其核心机制在于：由 kcov 子系统提供细粒度、确定性的代码覆盖反馈，并以此指导测试用例的变异与演化。
+在架构上，宿主机上的 \code{syz-manager} 负责管理一组测试虚拟机、维护语料库并归档问题；虚拟机或目标机内的 \code{syz-executor} 执行测试程序，并通过 \code{kcov} 收集每个系统调用触发的代码覆盖。
+为获得覆盖信息，被测内核需在编译期对绝大部分代码统一插入覆盖回调（仅通过手工维护的排除列表跳过 kcov 自身等少数文件），\code{syz-manager} 再借助内核符号表将采集到的指令地址映射回源码。
+一旦触发内核问题，\syz{} 通过解析串口输出中的 Oops、KASAN 等报告识别并去重问题，随后重启目标机继续测试。
+
+\aster{} 向上暴露 Linux 兼容 ABI，理论上可直接执行 \syz{} 的测试用例。然而，上述机制普遍建立在 Linux 宏内核的假设之上，在将 \syz{} 适配到 \aster{} 时，框内核独特的安全边界与运行环境带来了如下关键挑战：
+
+\begin{enumerate}[label=（\arabic*）,leftmargin=3em]
+  \item \emph{插桩与运行时底层互相干扰}：Linux 默认对整个内核统一插桩，并依赖手工维护的排除列表规避回调自身被插桩。若对 \aster{} 全内核注入 SanitizerCoverage，覆盖率回调 \code{\_\_sanitizer\_cov\_trace\_pc} 所依赖的任务查询、自旋锁和内存访问自身也会被插桩，引发\emph{无限递归问题}，中断上下文中的探针还会与持锁任务形成\emph{死锁}。此外，跨 crate LTO 会使插桩代码穿越 TCB 边界。
+  \item \emph{kcov 与内核符号观测接口缺失}：\aster{} 不提供覆盖收集与反馈相关子系统，因此既无法获取覆盖率，也无法将指令地址映射回源代码。
+  \item \emph{Rust Panic 崩溃格式无法解析与去重}：\aster{} 的崩溃日志与 Linux Oops/KASAN 格式存在差异，\syz{} 无法感知内核问题，导致漏报或重复报告。
+  \item \emph{完整系统虚拟机高昂的重启开销}：\aster{} 依托 NixOS 根文件系统，全系统重启耗时较长，频繁重置会严重削弱有效测试时间比率。
+\end{enumerate}
+
+\section{系统总体设计与核心功能}\label{sec:design}
+
+\subsection{总体架构}
+
+图~\ref{fig:arch} 给出了 \sa{} 的总体架构。系统由宿主机与目标机两部分组成；图中红色为 \sa{} 的 Rust 组件，蓝色为经过适配的 \syz{} 组件，灰色为 \aster{} 的可信计算基。
+\begin{itemize}
+  \item \emph{宿主机}：负责内核构建、测试调度与结果分析。选择性插桩器 \code{kcov-rustc} 在构建时仅对 \code{aster\_core} 注入覆盖率探针，\code{check-kcov-inst} 则预先校验插桩边界是否正确；随后由 \code{create-image.sh} 将插桩后的内核与 NixOS 用户态打包为目标机镜像，并保留带符号的 \code{vmlinux}。\code{syz-manager} 作为调度中枢，通过 ssh/rpc 向目标机分发测试程序，借助符号与 panic 解析将覆盖地址映射回源码、识别与去重问题，并由自适应生命周期管理在快照恢复与完整重启之间决策。语料库与崩溃记录保存在工作目录中，供 \code{eval-fuzz} 进行统计评估。
+  \item \emph{目标机}：运行以 \code{KCOV=1} 构建的 \aster{}。\code{syz-executor} 打开 \code{/dev/kcov} 后发起系统调用，进入被插桩的服务层 \code{aster\_core}；每个插桩点回调 OSTD 中的 \code{ostd::kcov}，经裸函数跳板与 \code{record\_pc} 将 PC 记录到 \code{KcovBuffer}。该缓冲区以共享 VMO 的形式映射到 \code{syz-executor} 的地址空间，覆盖信息无需拷贝即可回传。OSTD 自身不插桩，从而保证可信计算基不受覆盖率回调影响。此外，\code{check-asterinas-kcov} 在运行期登录目标机，验证 \code{/dev/kcov} 的 ABI 行为是否与 Linux 一致。
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.92\textwidth]{arch.pdf}
+\caption{\sa{} 总体架构}
+\label{fig:arch}
+\end{figure}
+
+\section{技术实现}
+\label{sec:impl}
+
+\subsection{框内核感知的选择性插桩}
+
+针对挑战（1），\sa{} 的核心思路是\emph{让插桩边界与框内核的 TCB 边界重合}，即只插桩服务层，不插桩 OSTD。
+为此，\sa{} 借助 Cargo 提供的编译器包装机制接入自研的选择性插桩器 \code{kcov-rustc}：它在每次调用 Rust 编译器前检查待编译 crate 的名称与目标平台，仅当编译对象为内核服务层 \code{aster\_core} 时才启用 LLVM SanitizerCoverage 插桩；OSTD 中的页表、中断处理、自旋锁以及覆盖率记录器本身均按原样编译。插桩判定逻辑如代码~\ref{lst:wrapper} 所示。
+
+\begin{lstlisting}[language=Rust,caption={\code{kcov-rustc} 的插桩判定（部分实现）},label={lst:wrapper}]
+let mut cmd = Command::new(rustc);
+cmd.args(rest);
+if crate_name == Some("aster_core") && target == Some("x86_64-unknown-none") {
+    cmd.args(["-C", "passes=sancov-module",
+              "-C", "llvm-args=-sanitizer-coverage-level=3",
+              "-C", "llvm-args=-sanitizer-coverage-trace-pc"]);
+}
+\end{lstlisting}
+
+仅按 crate 区分仍不足以保证边界：若启用跨 crate 的链接时优化（LTO），编译器可能将已插桩的函数内联进 OSTD，或将 OSTD 的函数内联进插桩区域，使边界失效。因此，内核的覆盖率构建开关在开启插桩的同时会强制关闭跨 crate LTO。
+
+由于完整编译一次插桩内核耗时较长，\sa{} 还提供了前置快速校验工具 \code{check-kcov-inst}。它构造一个最小的内核风格探针程序，分别以服务层和 OSTD 的身份经插桩器编译，再解析生成的目标文件：前者必须引用覆盖率回调符号，后者必须不引用，两项同时成立才判定通过。这样，编译器升级或插桩器失效等问题可在数秒内暴露，而无需等待完整的内核构建。
+
+\subsection{面向框内核的覆盖信息收集}
+
+覆盖率运行时位于 OSTD 中，自身不被插桩。它需要满足三项约束：回调不能递归，不能在任何上下文中阻塞或死锁，也不能因用户态篡改共享内存而越界写入内核。
+
+\paragraph{裸函数跳板。}SanitizerCoverage 在每条控制流边上（关键边会被拆分为独立的基本块）插入一次对覆盖率回调的调用，并约定由回调自行获取调用者的程序计数器（PC）。\sa{} 使用 Rust 的裸函数（naked function）特性实现该回调：它仅用两条汇编指令从栈顶取出返回地址作为 PC，再尾跳转到普通的 Rust 记录函数。跳板不建立栈帧，也不改变调用者的栈对齐，从而把汇编部分压缩到最小，其余逻辑全部由安全 Rust 实现。跳板与记录函数的实现如代码~\ref{lst:runtime} 所示。
+
+\begin{lstlisting}[language=Rust,caption={OSTD 中的覆盖率回调（节选）},label={lst:runtime}]
+#[unsafe(naked)] #[unsafe(no_mangle)]
+extern "C" fn __sanitizer_cov_trace_pc() {
+    core::arch::naked_asm!("mov rdi, [rsp]", "jmp {}", sym record_pc);
+}
+extern "C" fn record_pc(pc: usize) {
+    if crate::IN_BOOTSTRAP_CONTEXT.load(Ordering::Relaxed)
+        || !InterruptLevel::current().is_task_context() { return; }
+    let Some(task) = Task::current() else { return };
+    // 丢弃嵌套调用，中断处理程序不计入任务覆盖率，避免自旋
+    let Some(slot) = task.kcov.try_lock() else { return };
+    if let Some(attachment) = slot.as_ref() { attachment.0.record(pc); }
+}
+\end{lstlisting}
+
+\paragraph{不可重入与上下文过滤。}记录函数依次排除三种情况：内核尚未完成初始化的启动阶段、硬件中断等非任务上下文，以及当前任务的覆盖率槽位已被持有（即发生嵌套调用）。对于最后一种情况，记录函数采用“尝试加锁、失败即放弃”的非阻塞策略，而非在锁上自旋等待；即使回调恰好发生在操作槽位的临界区内，也只会丢弃一个样本，而不会造成死锁。这与 Linux kcov“只记录任务上下文”的语义一致，也保证 \syz{} 获得的是确定的、逐系统调用的覆盖信息。
+
+\paragraph{敌意共享内存的边界检查。}覆盖率缓冲区由若干与用户态共享的物理页构成，其首个字记录已写入的 PC 数量，而用户态可以随意改写该值。因此，运行时将这一计数视为\emph{不可信输入}：每次只读取一次并保存在局部变量中，以避免检查与使用之间被并发篡改；随后检查其是否越过缓冲区容量，确认安全后才写入新的 PC；最后借助编译器屏障并结合 x86-64 的存储有序性，保证 PC 先于新的计数对用户态可见。
+
+\paragraph{所有权与生命周期。}每个任务至多绑定一个覆盖率缓冲区，同一缓冲区也至多被一个任务启用。绑定关系由一个所有权对象表示，其析构时自动清除缓冲区的活跃标志。因此，无论任务是主动关闭覆盖率还是退出（包括异常退出），绑定关系都会借助 Rust 的 RAII 机制被确定性地释放，不会留下悬挂的覆盖率写入者；与 Linux kcov 一致，仅关闭设备文件并不会中止记录，缓冲区由绑定关系持有直至解绑。
+
+\subsection{覆盖反馈与符号解析子系统}
+
+针对挑战（2），\sa{} 在服务层中新增了与 Linux 64 位 kcov ABI 兼容的字符设备 \code{/dev/kcov}，其接口语义与校验规则如表~\ref{tab:abi} 所示。该设备仅允许特权用户打开，只支持基于 PC 的覆盖追踪模式，比较操作数追踪与远程覆盖等扩展模式会被明确拒绝。初始化时，设备一次性分配并预先提交覆盖率缓冲区所需的全部物理页，从而保证覆盖率回调路径上不会发生缺页或内存分配。
+
+\input{tables/kcov.tex}
+
+为了让 \code{syz-manager} 将目标机上采集的 PC 映射回源代码，\sa{} 还在内核链接脚本中导出代码段的起止符号，并新增 \code{/proc/kallsyms} 节点向用户态提供这一地址范围。同时，镜像构建脚本会保留一份带完整符号表与调试信息的未剥离内核镜像，并校验其中确实包含覆盖率回调，避免内核打包过程剥离符号后覆盖地址无法对应到源码。
+
+\subsection{syzkaller 适配}
+
+为对Asterinas框内核实现覆盖制导模糊测试，\sa{} 对 \syz{} 的不同模块进行了修改与适配，具体来说：
+\begin{itemize}
+  \item \emph{执行器模块}：执行器优先尝试 Linux 的 debugfs 覆盖率接口，在其不存在时自动回退到 \aster{} 提供的 \code{/dev/kcov}，同时放宽对网络过滤、网络命名空间等 \aster{} 尚未完整支持的内核特性的启动检查，使执行器能够在目标机上正常运行；
+  \item \emph{符号解析模块}：当内核未提供 Linux 惯用的代码段起始符号时，回退使用 \aster{} 导出的等价符号，在关闭覆盖率时跳过内核模块解析，使无覆盖反馈的对照配置同样可运行；
+  \item \emph{问题报告解析模块}：针对挑战（3），使 \syz{} 能够识别 \aster{} 的 Rust panic 报告，并从中提取 panic 原因与源码位置生成问题标题。标题中的路径只保留最后若干级，行号被归一化，使同一问题在不同构建路径和代码行漂移下仍能被正确去重。
+  \item \emph{内核生命周期管理模块}：详见下一段落。
+\end{itemize}
+
+针对挑战（4），\sa{} 为 \code{syz-manager} 增加了自适应生命周期控制模块，并扩展其 QEMU 后端以支持虚拟机快照的保存、恢复与删除，同时固定虚拟机的 TSC 频率，以保证快照恢复后客户机时钟的一致性。虚拟机启动完成后先保存一个干净快照。之后，控制器在每个评估窗口内为每台虚拟机从四个动作中选择一个：\emph{继续模糊测试}、\emph{保存检查点}、\emph{软重启}（从快照库中随机选一个快照恢复）、\emph{硬重启}（重建虚拟机实例）。
+
+动作选择被建模为上下文多臂老虎机，采用带折扣的线性 UCB。上下文是一个 16 维特征向量 $x$，包括目标机运行时间、执行吞吐及其相对峰值的比例、新信号与稳定信号、新输入、软重启次数等。对每个动作 $a$ 维护 $A_a$ 与 $\mathbf{b}_a$，选择
+\[
+  a^\ast = \arg\max_a\; \hat{\boldsymbol\theta}_a^{\top}x + \alpha\sqrt{x^{\top}A_a^{-1}x},\qquad \hat{\boldsymbol\theta}_a = A_a^{-1}\mathbf{b}_a .
+\]
+每次观测后，所有动作模型都会向先验折扣衰减，避免长期未被选中的动作保留过时的估计。奖励综合了单位时间内的新覆盖、新种子和新独特问题，减去挂起、重复问题、动作停机时间与动作失败的惩罚。该模块还设置了目标机最长存活时间、软重启次数上限等安全边界，触发边界时强制硬重启，且这类样本不参与策略训练。
+
+\section{相关工作}\label{sec:related}
+
+\subsection{操作系统内核模糊测试}
+
+以 \syz{}~\cite{syzkaller} 为代表的覆盖制导系统调用模糊测试已成为主流操作系统质量保障的标准工具。
+\syz{} 结合了描述性系统调用模型声明（syzlang）、反馈驱动的输入变异演化以及依托 kcov 的内核代码覆盖率采集机制，在 Linux、FreeBSD、OpenBSD、NetBSD 等宏内核中发现了数千个安全与系统问题~\cite{syzbot}。
+MoonShine~\cite{Pailoor2018MoonShine} 从真实程序的系统调用轨迹中提炼精简而多样的种子序列；
+SyzVegas~\cite{Wang2021SyzVegas} 借助强化学习（多臂老虎机）动态调整 \syz{} 的任务与种子选择策略；
+SyzScope~\cite{Zou2022SyzScope} 从看似低危的模糊测试问题中自动挖掘其潜在的高危安全影响；SyzDirect~\cite{Tan2023SyzDirect} 则面向 Linux 内核实现了到达特定目标位置的定向灰盒模糊测试。
+SyzPilot~\cite{Zhang2027SyzPilot} 利用状态引导的大语言模型智能体自动合成系统调用规约，以提升内核模糊测试的覆盖能力。
+然而，上述工作均基于传统 C 语言单体宏内核假定，依赖 Linux 的全局内核插桩与成熟的 \code{debugfs} 设施，缺乏对安全内存语言编写的“框内核”体系结构（TCB 严格隔离、无 \code{debugfs}、安全服务层与硬件抽象层分界）的感知与适配。
+
+\subsection{Rust 程序模糊测试}
+
+在用户态 Rust 生态中，\code{cargo-fuzz} 与 \code{afl.rs} 将 libFuzzer 与 AFL 引入 Rust 项目，但 fuzz driver 仍需开发者手工编写。
+由于 Rust 库以 API 形式对外提供功能，且调用时须满足所有权、生命周期以及 trait 约束，如何自动生成合法且有效的 API 调用序列成为研究重点。
+RULF~\cite{Jiang2021RULF} 基于 API 依赖图遍历自动合成 fuzz driver，覆盖尽可能多的 API 组合；
+SyRust~\cite{Takashima2021SyRust} 将 Rust 所有权类型系统中的类型约束编码为逻辑约束进行程序合成，从而生成类型正确、语义有效的 API 调用序列；
+RPG~\cite{Xu2024RPG} 提出基于 API 池的 fuzz driver 生成方法，优先生成涉及 \code{unsafe} 代码及 API 间交互的多样化调用序列，并支持泛型 API 且校验 fuzz driver 的语法与语义有效性，从而触达更深的库内部逻辑。
+随着大语言模型的发展，PromptFuzz~\cite{Lyu2024PromptFuzz} 以覆盖率为反馈对提示词进行变异，迭代地生成库 API 的 fuzz driver，进一步降低了 fuzz driver 编写的人工成本。
+然而，上述工作均以用户态库的 API 为测试入口，fuzz driver 运行在普通进程中；
+内核的系统调用接口、中断与多任务调度上下文、以及框内核中 OSTD 与服务层之间的 TCB 边界，均超出了它们的适用范围。
+\sa{} 与之互补：以系统调用为入口、以框内核感知的 kcov 为反馈，对 Rust 编写的操作系统内核本身进行覆盖制导模糊测试。
+
+\section{Rust 核心作用与语言技术深度}\label{sec:rust}
+
+在 \sa{} 中，Rust 承担了内核关键路径、可信边界划分、并发控制与可观测性基础设施的实现。第~\ref{sec:impl} 节已给出各模块的实现细节，本节从语言特性的角度归纳 Rust 在其中发挥的作用。
+
+\subsection{裸函数}
+
+Linux 以 C 语言实现 \code{\_\_sanitizer\_cov\_trace\_pc}，借助编译器内建函数获取返回地址，并在同一函数中完成记录；而 \sa{} 借助 \code{\#[unsafe(naked)]} 与 \code{core::arch::naked\_asm!}，只用 \code{mov rdi, [rsp]} 和尾跳转两条指令取得调用者 PC（代码~\ref{lst:runtime}）。尾跳转不建立栈帧，进入 \code{record\_pc} 时仍满足 System V AMD64 ABI 的 16 字节栈对齐；控制流一旦离开跳板，上下文判定、加锁与边界检查便全部回到编译器可静态检查的安全 Rust 中。
+
+\subsection{类型与所有权}
+
+\begin{itemize}
+  \item \emph{非阻塞并发}：\code{try\_lock()} 返回 \code{Option<SpinLockGuard>}，嵌套调用只能得到 \code{None} 并丢弃样本，编译器强制调用方处理``拿不到锁''的分支；锁守卫的生命周期由借用检查器约束，离开作用域即释放。
+  \item \emph{上下文过滤}：\code{InterruptLevel::current().is\_task\_context()} 在入口处排除所有中断上下文，从源头上避免中断处理程序与被中断任务争用同一自旋锁。
+  \item \emph{RAII 确定性析构}：任务绑定以 \code{Attachment(Arc<KcovBuffer>)} 表示，其 \code{Drop} 实现以 \code{Release} 内存序复位活跃标志。无论是 \code{KCOV\_DISABLE} 还是线程（异常）退出，只要 \code{Option<Attachment>} 被置为 \code{None}，解绑就一定发生，C 实现中常见的清理路径遗漏在类型层面被排除。
+\end{itemize}
+
+\subsection{防御性内存交互}
+
+共享缓冲区的首个字可被用户态任意改写。代码~\ref{lst:record} 把它当作敌意输入处理：单次 \code{read\_once} 拷贝到局部变量以消除 TOCTOU 竞争；\code{count >= entries - 1} 的上界检查保证即使计数被改成 \code{usize::MAX} 也不会越界；\code{compiler\_fence(Release)} 结合 x86-64 的存储有序性，保证用户态看到计数递增时对应 PC 已经写入。所有页内写入都经 \code{write\_once} 返回 \code{Result}，不存在裸指针运算。
+
+\begin{lstlisting}[language=Rust,caption={\code{KcovBuffer::record} 的防御性写入},label={lst:record}]
+fn record(&self, pc: usize) {
+    let Ok(count) = self.frames[0].read_once::<usize>(0) else { return; };
+    if count >= self.entries - 1 { return; }
+    let index = count + 1;
+    let frame = &self.frames[index / WORDS_PER_PAGE];
+    if frame.write_once((index % WORDS_PER_PAGE) * WORD_SIZE, &pc).is_err() { return; }
+    compiler_fence(Ordering::Release);
+    let _ = self.frames[0].write_once(0, &(count + 1));
+}
+\end{lstlisting}
+
+\section{总结与展望}\label{sec:conclusion}
+
+\subsection{工作总结}
+
+针对新兴的 Rust 框内核操作系统 \aster{}，本文提出了覆盖制导的系统调用级模糊测试原型系统 \sa{}。\sa{} 克服了框内核特有的 TCB 安全边界保护、非重入上下文过滤、kcov ABI 缺失、Rust 特有 panic 问题去重以及内核高昂的重启开销等问题，实现了：
+（1）\emph{面向框内核的覆盖制导灰盒模糊测试}：仅对服务层 \code{aster\_core} 插桩，并以 Rust 实现内核覆盖收集，使 \syz{} 可用于 \aster{}；
+（2）\emph{自适应内核生命周期管理}：基于Linear UCB 上下文多臂老虎机的内核生命周期管理，自适应选择快照恢复或完整重启。
+
+随着 \aster{} 及 Rust 内核生态演化，\sa{} 未来可在以下方向推进：（1）\emph{多架构泛化}：从 x86\_64 拓展至 ARM64 与 RISC-V 平台；（2）\emph{异步内核调度覆盖率追踪}：研究针对 Rust \code{async}/\code{await} 协程任务状态机的细粒度状态反馈机制；（3）\emph{规格自动合成}：基于 AST 与类型系统自动提取 syzlang 系统调用规格。
+
+\subsection{人工智能工具使用与过程真实性说明}\label{sec:ai-statement}
+
+根据竞赛要求，参赛队伍声明：
+（1）\emph{使用工具}：Claude Opus 5.5 / Gemini 4 Argon 辅助生成模型；
+（2）\emph{使用范围}：辅助编写单元测试代码、润色文本表达等；
+（3）\emph{审查与真实性}：所有代码与文档均经过队员多次严格人工审查。
+
+本参赛项目完全秉持开源精神，源码遵从 Apache-2.0 与 MPL-2.0 开源许可证，开源托管于 GitHub：\url{https://github.com/Radon10043/SyzAster}。全部提交内容不存在抄袭、代做或数据伪造。
+
+\printbibliography[heading=bibintoc, title=参考文献]
+
+\end{document}

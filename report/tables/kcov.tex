@@ -1,0 +1,18 @@
+\begin{table}[htbp]
+    \centering\small\setlength{\tabcolsep}{4pt}
+    \caption{\code{/dev/kcov} 支持的接口与校验规则}
+    \label{tab:abi}
+    \begin{tabularx}{\textwidth}{@{}lX@{}}
+    \toprule
+    \emph{接口与系统调用} & \emph{语义规范与严格防御规则} \\
+    \midrule
+    \code{open} & 必须具有 root 凭据，否则拒绝并返回 \code{EPERM}，每次打开分配独立 \code{KcovFile} \\
+    \code{KCOV\_INIT\_TRACE} & 条目数限制在 $[2, 2^{20}]$ 范围，否则 \code{EINVAL}，重复初始化直接返回 \code{EBUSY} \\
+    \code{KCOV\_ENABLE} & 参数必须为 0（仅支持 trace-pc）；未初始化返回 \code{EINVAL}；已被绑定返回 \code{EBUSY} \\
+    \code{KCOV\_DISABLE} & 严格校验调用者所有权，只有绑定该缓冲区的当前任务可解除，否则返回 \code{EINVAL} \\
+    \code{mmap} & 强制要求 \code{MAP\_SHARED}、偏移 0 且映射长度恰好等于 VMO 总尺寸，否则拒绝 \\
+    \code{read} / \code{write} / \code{lseek} & 字符设备不支持流式读写与寻道，分别明确返回 \code{EINVAL} 与 \code{ESPIPE} \\
+    \code{/proc/kallsyms} & 仅 root 可读，动态导出链接脚本锚定的 \code{\_stext} 与 \code{\_etext} 符号边界 \\
+    \bottomrule
+    \end{tabularx}
+\end{table}
