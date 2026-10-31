@@ -12,7 +12,7 @@ This document serves as the authoritative operational guide for AI agents and hu
   - **`src/pkg/`**: Zero-dependency library modules (`elf.rs`, `eval.rs`, `json.rs`, `kcov.rs`, `tools.rs`).
 - **`syzkaller/`**: Upstream `syzkaller` repository tracked as a Git submodule.
 - **`patch/`**: Curated patch sets for upstream components.
-  - **`patch/syzkaller/`**: Patches adapting `syzkaller` for Asterinas (`/dev/kcov` fallback, symbol resolution, panic parsing, configuration templates).
+  - **`patch/syzkaller/`**: Patches adapting `syzkaller` for Asterinas (`/dev/kcov` fallback, symbol resolution, panic parsing, configuration templates, adaptive snapshot restoration).
   - **`patch/asterinas/v0.18.1/`**: Patches providing task-scoped KCOV runtime, `/dev/kcov` character device, and `/proc/kallsyms` for Asterinas `v0.18.1`.
 - **`scripts/`**: Standalone, pure Shell scripts for kernel patching, image generation, VM launching, and crash reproduction.
 - **`configs/`**: Reusable configuration templates for fuzzing campaigns, kernel targets, and repro runs.

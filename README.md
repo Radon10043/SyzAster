@@ -31,6 +31,7 @@ Asterinas adopts a **framekernel** architecture that divides the operating syste
   - `0002`: Extends `pkg/cover/backend` and `pkg/vminfo` to fall back to `__stext` when `_stext` is absent and tolerate missing `/proc/kallsyms` when `cover: false`.
   - `0003`: Extends `pkg/report` to recognize Asterinas `Uncaught panic:` stack traces and extract the panic message and source location (`file:LINE`) into deduplicated crash titles.
   - `0004`: Adds Asterinas QEMU `mgrconfig` test fixtures and setup documentation.
+  - `0005`: Adds adaptive snapshot restoration with four actions (continue, checkpoint save, soft reboot, hard reboot), random snapshot selection on soft reboot, and TSC calibration.
 - **Rust Verification & Statistical Evaluation Suite (`src/` -> `bin/`)**:
   - Zero-external-dependency Rust library (`src/pkg/`) and CLI binaries (`syzaster`, `check-asterinas-kcov`, `check-kcov-inst`, `kcov-rustc`, `eval-fuzz`) paired with standalone operational shell scripts (`scripts/`) for image creation, QEMU launching, crash triage, and reproduction.
 

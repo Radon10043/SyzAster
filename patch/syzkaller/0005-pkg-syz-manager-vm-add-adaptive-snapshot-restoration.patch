@@ -1,0 +1,4816 @@
+From b563e6038143ccfcfae2660fccba21285309202e Mon Sep 17 00:00:00 2001
+From: Jiaming Zhang <772577952@qq.com>
+Date: Sat, 31 Oct 2026 14:29:58 +0800
+Subject: [PATCH] pkg, syz-manager, vm: add adaptive snapshot restoration with
+ random selection
+
+Migrate snapshot restoration and adaptive restart mechanism into syzkaller
+with random snapshot bank selection on soft reboot.
+
+The adaptive controller supports four actions:
+- Continue fuzzing in-place
+- Save checkpoint snapshot
+- Soft reboot by restoring a randomly chosen snapshot from the snapshot bank
+- Hard reboot by restarting the VM instance
+
+Features:
+- pkg/adaptive: controller, linear UCB bandit learner, snapshot bank with
+  random snapshot selection, lineage recovery, and concurrency limits
+- pkg/tsc: TSC timer and TSC frequency calibration on x86_64
+- pkg/corpus: return bool on Save to detect new seeds
+- pkg/fuzzer: VMFeedback collection and queue executor validity
+- pkg/mgrconfig: crash_snapshot and adaptive_restart config options
+- syz-manager: snapshot lifecycle management, lease control, and stats
+- vm/qemu: QMP savevm, loadvm, and delvm commands with TSC pinning
+---
+ pkg/adaptive/adaptive.go     |   19 +
+ pkg/adaptive/learning.go     |  244 +++++++
+ pkg/adaptive/restart.go      | 1183 +++++++++++++++++++++++++++++++++
+ pkg/adaptive/restart_test.go | 1203 ++++++++++++++++++++++++++++++++++
+ pkg/adaptive/state.go        |  345 ++++++++++
+ pkg/corpus/corpus.go         |    3 +-
+ pkg/corpus/corpus_test.go    |   11 +-
+ pkg/execbackend/rpc.go       |    4 +
+ pkg/execbackend/server.go    |    4 +
+ pkg/execbackend/snapshot.go  |    4 +
+ pkg/fuzzer/fuzzer.go         |   86 +++
+ pkg/fuzzer/fuzzer_test.go    |   55 ++
+ pkg/fuzzer/job.go            |   19 +-
+ pkg/fuzzer/queue/queue.go    |    5 +-
+ pkg/mgrconfig/config.go      |   48 ++
+ pkg/mgrconfig/load.go        |   91 +++
+ pkg/mgrconfig/load_test.go   |   57 ++
+ pkg/rpcserver/runner.go      |    3 +-
+ pkg/tsc/tsc.go               |  157 +++++
+ pkg/tsc/tsc_amd64.go         |    8 +
+ pkg/tsc/tsc_amd64.s          |   18 +
+ pkg/tsc/tsc_other.go         |   12 +
+ pkg/tsc/tsc_test.go          |   50 ++
+ syz-manager/manager.go       |  314 +++++++++
+ syz-manager/stats.go         |  124 ++++
+ vm/qemu/qemu.go              |   52 +-
+ vm/qemu/qmp.go               |   83 ++-
+ vm/vm.go                     |   54 +-
+ vm/vmimpl/vmimpl.go          |    5 +-
+ 29 files changed, 4216 insertions(+), 45 deletions(-)
+ create mode 100644 pkg/adaptive/adaptive.go
+ create mode 100644 pkg/adaptive/learning.go
+ create mode 100644 pkg/adaptive/restart.go
+ create mode 100644 pkg/adaptive/restart_test.go
+ create mode 100644 pkg/adaptive/state.go
+ create mode 100644 pkg/tsc/tsc.go
+ create mode 100644 pkg/tsc/tsc_amd64.go
+ create mode 100644 pkg/tsc/tsc_amd64.s
+ create mode 100644 pkg/tsc/tsc_other.go
+ create mode 100644 pkg/tsc/tsc_test.go
+
+diff --git a/pkg/adaptive/adaptive.go b/pkg/adaptive/adaptive.go
+new file mode 100644
+index 000000000..ecf4dcb92
+--- /dev/null
++++ b/pkg/adaptive/adaptive.go
+@@ -0,0 +1,19 @@
++package adaptive
++
++import (
++	"github.com/google/syzkaller/pkg/report"
++	"github.com/google/syzkaller/pkg/report/crash"
++)
++
++// UsefulAdaCrash checks whether a crash is useful for adaptive mechanism
++func UsefulAdaCrash(rep *report.Report) bool {
++	if rep == nil || rep.Title == "" || rep.Suppressed {
++		return false
++	}
++	switch rep.Type {
++	case crash.LostConnection, crash.NoOutput, crash.SyzFailure:
++		return false
++	default:
++		return true
++	}
++}
+diff --git a/pkg/adaptive/learning.go b/pkg/adaptive/learning.go
+new file mode 100644
+index 000000000..465b9693e
+--- /dev/null
++++ b/pkg/adaptive/learning.go
+@@ -0,0 +1,244 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package adaptive
++
++import (
++	"math"
++	"time"
++)
++
++const featureCount = 16
++
++type features [featureCount]float64
++
++type linearUCBModel struct {
++	matrix [featureCount][featureCount]float64
++	reward features
++	prior  features
++	count  uint64
++}
++
++type linearUCB struct {
++	models   map[RestartAct]*linearUCBModel
++	alpha    float64
++	discount float64
++}
++
++func newLinearUCB(alpha, discount float64) *linearUCB {
++	learner := &linearUCB{
++		models:   make(map[RestartAct]*linearUCBModel),
++		alpha:    alpha,
++		discount: discount,
++	}
++	for action := range RestartActionCount {
++		model := new(linearUCBModel)
++		for index := range featureCount {
++			model.matrix[index][index] = 1
++		}
++		model.prior[0] = map[RestartAct]float64{
++			RestartContinue:   0.25,
++			RestartCheckpoint: -0.10,
++			RestartSoft:       0,
++			RestartHard:       -0.50,
++		}[action]
++		model.reward = model.prior
++		learner.models[action] = model
++	}
++	return learner
++}
++
++// selectAction chooses an eligible action for the current context. It
++// prioritizes actions without a completed sample before selecting the action
++// with the highest UCB score.
++func (l *linearUCB) selectAction(feats features, actions []RestartAct,
++	tieBreaker float64) RestartAct {
++	if len(actions) == 0 {
++		return RestartContinue
++	}
++	start := int(tieBreaker * float64(len(actions)))
++	if start >= len(actions) {
++		start = len(actions) - 1
++	}
++	// A positive reward for the conservative continue action can otherwise
++	// dominate before any recovery action is sampled. Explore each action once
++	// while still respecting the caller's safety constraints.
++	for offset := range len(actions) {
++		action := actions[(start+offset)%len(actions)]
++		if l.models[action].count == 0 {
++			return action
++		}
++	}
++	best, bestScore := actions[start], math.Inf(-1)
++	for offset := range len(actions) {
++		action := actions[(start+offset)%len(actions)]
++		score := l.score(action, feats)
++		if score > bestScore {
++			best, bestScore = action, score
++		}
++	}
++	return best
++}
++
++// score returns an action's Linear-UCB score: its predicted reward plus an
++// exploration bonus proportional to prediction uncertainty.
++func (l *linearUCB) score(action RestartAct, feats features) float64 {
++	model := l.models[action]
++	inverse, ok := invertMatrix(model.matrix)
++	if !ok {
++		return math.Inf(1)
++	}
++	theta := multiplyMatrixVector(inverse, model.reward)
++	prediction := dotFeatures(theta, feats)
++	uncertaintyVector := multiplyMatrixVector(inverse, feats)
++	uncertainty := math.Sqrt(max(0, dotFeatures(feats, uncertaintyVector)))
++	return prediction + l.alpha*uncertainty
++}
++
++// update discounts every action model toward its prior, then records the
++// observed context and reward for the selected action.
++func (l *linearUCB) update(act RestartAct, feats features, reward float64) {
++	// Decay every action model on every observation. Decaying only the selected
++	// action leaves unselected actions with permanently stale estimates.
++	for _, model := range l.models {
++		for row := range featureCount {
++			for column := range featureCount {
++				identity := 0.0
++				if row == column {
++					identity = 1
++				}
++				model.matrix[row][column] =
++					identity + l.discount*(model.matrix[row][column]-identity)
++			}
++			model.reward[row] =
++				model.prior[row] + l.discount*(model.reward[row]-model.prior[row])
++		}
++	}
++	model := l.models[act]
++	for row := range featureCount {
++		for column := range featureCount {
++			model.matrix[row][column] += feats[row] * feats[column]
++		}
++		model.reward[row] += reward * feats[row]
++	}
++	model.count++
++}
++
++// multiplyMatrixVector returns the matrix-vector product.
++func multiplyMatrixVector(matrix [featureCount][featureCount]float64, vector features) features {
++	var result features
++	for row := range featureCount {
++		for column := range featureCount {
++			result[row] += matrix[row][column] * vector[column]
++		}
++	}
++	return result
++}
++
++// dotFeatures returns the dot product of two feature vectors.
++func dotFeatures(left, right features) float64 {
++	var result float64
++	for index := range featureCount {
++		result += left[index] * right[index]
++	}
++	return result
++}
++
++// invertMatrix uses Gauss-Jordan elimination with partial pivoting to return
++// the inverse and whether the matrix is sufficiently non-singular.
++func invertMatrix(input [featureCount][featureCount]float64) ([featureCount][featureCount]float64, bool) {
++	var augmented [featureCount][featureCount * 2]float64
++	for row := range featureCount {
++		for column := range featureCount {
++			augmented[row][column] = input[row][column]
++		}
++		augmented[row][featureCount+row] = 1
++	}
++	for pivot := range featureCount {
++		best := pivot
++		for row := pivot + 1; row < featureCount; row++ {
++			if math.Abs(augmented[row][pivot]) > math.Abs(augmented[best][pivot]) {
++				best = row
++			}
++		}
++		if math.Abs(augmented[best][pivot]) < 1e-12 {
++			return [featureCount][featureCount]float64{}, false
++		}
++		augmented[pivot], augmented[best] = augmented[best], augmented[pivot]
++		scale := augmented[pivot][pivot]
++		for column := range featureCount * 2 {
++			augmented[pivot][column] /= scale
++		}
++		for row := range featureCount {
++			if row == pivot {
++				continue
++			}
++			factor := augmented[row][pivot]
++			for column := range featureCount * 2 {
++				augmented[row][column] -= factor * augmented[pivot][column]
++			}
++		}
++	}
++	var inverse [featureCount][featureCount]float64
++	for row := range featureCount {
++		copy(inverse[row][:], augmented[row][featureCount:])
++	}
++	return inverse, true
++}
++
++type learningSample struct {
++	action    RestartAct
++	features  features
++	baseline  feedbackSnapshot
++	started   time.Time
++	cost      time.Duration
++	snapshot  string
++	learn     bool
++	attempted bool
++	failed    bool
++}
++
++// Reward returns the observed utility of an adaptive action. It rewards
++// time-normalized fuzzing progress and throughput, and penalizes unhealthy
++// executions, action downtime, and action failure.
++func Reward(delta feedbackSnapshot, elapsed, cost time.Duration, failed bool) float64 {
++	const minObs = time.Second
++	obsMinutes := max(elapsed, minObs).Minutes()
++	progress := 2*math.Log1p(float64(delta.newSignal)) +
++		5*math.Log1p(float64(delta.stableSignal)) +
++		8*float64(delta.newInputs) +
++		1.5*math.Log1p(stateNoveltyRate(delta)) +
++		25*float64(delta.uniqueCrashes)
++	progress /= obsMinutes
++	repCrashes := repeatedCrashCount(delta)
++	healthPenalty := (3*float64(delta.hangs+delta.failures) + float64(repCrashes)) /
++		obsMinutes
++	downtimePenalty := 0.0
++	if elapsed > 0 {
++		downtimePenalty = 10 * float64(cost) / float64(elapsed)
++	}
++	throughput := math.Log1p(float64(delta.execs)/obsMinutes) / 10
++	failurePenalty := 0.0
++	if failed {
++		failurePenalty = 50
++	}
++	return progress + throughput - healthPenalty - downtimePenalty - failurePenalty
++}
++
++// repeatedCrashCount returns crashes that were not newly unique, clamped to
++// zero because the two counters may be observed between concurrent updates.
++func repeatedCrashCount(window feedbackSnapshot) uint64 {
++	// Crash and unique-crash counters are updated separately. A concurrent
++	// snapshot can therefore observe the unique counter in the next window.
++	if window.crashes <= window.uniqueCrashes {
++		return 0
++	}
++	return window.crashes - window.uniqueCrashes
++}
++
++func stateNoveltyRate(window feedbackSnapshot) float64 {
++	if window.stateEvents == 0 {
++		return 0
++	}
++	return 1000 * float64(window.stateNovelty) / float64(window.stateEvents)
++}
+diff --git a/pkg/adaptive/restart.go b/pkg/adaptive/restart.go
+new file mode 100644
+index 000000000..37564f898
+--- /dev/null
++++ b/pkg/adaptive/restart.go
+@@ -0,0 +1,1183 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package adaptive
++
++import (
++	"context"
++	"fmt"
++	"math"
++	"math/rand"
++	"slices"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/google/syzkaller/pkg/fuzzer"
++	"github.com/google/syzkaller/pkg/mgrconfig"
++	"github.com/google/syzkaller/pkg/stat"
++)
++
++type RestartAct int
++
++// CleanSnapshotName is the base snapshot saved right after VM boot. It is
++// always a valid crash-recovery target.
++const CleanSnapshotName = "clean"
++
++const (
++	RestartContinue RestartAct = iota
++	RestartCheckpoint
++	RestartSoft
++	RestartHard
++	RestartActionCount
++)
++
++type RestartReason string
++
++const (
++	RestartReasonStalled         RestartReason = "stalled"
++	RestartReasonThroughput      RestartReason = "throughput"
++	RestartReasonUnhealthy       RestartReason = "unhealthy"
++	RestartReasonLeaseLimit      RestartReason = "lease-limit"
++	RestartReasonVMLifetime      RestartReason = "vm-lifetime"
++	RestartReasonTooManyRestores RestartReason = "too-many-restores"
++	RestartReasonOnlinePolicy    RestartReason = "online-policy"
++	RestartReasonStatePromotion  RestartReason = "state-promotion"
++	RestartReasonActionLimit     RestartReason = "action-limit"
++	RestartReasonCrashRecovery   RestartReason = "crash-recovery"
++	RestartReasonRunEnded        RestartReason = "run-ended"
++)
++
++type RestartDecision struct {
++	Action           RestartAct
++	Reason           RestartReason
++	LeaseAge         time.Duration
++	VMAge            time.Duration
++	StagnantFor      time.Duration
++	Execs            uint64
++	NewSignal        uint64
++	StableSignal     uint64
++	NewInputs        uint64
++	Hangs            uint64
++	Failures         uint64
++	Restarts         uint64
++	Crashes          uint64
++	UniqueCrashes    uint64
++	StateNovelty     uint64
++	StateEvents      uint64
++	StateNoveltyRate float64
++	StateValue       float64
++	StateAge         time.Duration
++	StateDigest      uint64
++	SoftResets       int
++	SnapshotName     string
++	DeleteSnapshot   string
++
++	fingerprint  stateFingerprint
++	noveltyScore uint64
++}
++
++// String returns the decision and its observation context in log-friendly form.
++func (dec RestartDecision) String() string {
++	return fmt.Sprintf("action=%v reason=%v lease_age=%v vm_age=%v stagnant=%v "+
++		"execs=%v new_signal=%v stable_signal=%v new_inputs=%v hangs=%v failures=%v restarts=%v "+
++		"crashes=%v unique_crashes=%v state_novelty=%v state_events=%v state_novelty_rate=%.3f "+
++		"state_value=%.3f state_age=%v "+
++		"state_digest=%x soft_resets=%v snapshot=%q",
++		dec.Action, dec.Reason, dec.LeaseAge, dec.VMAge,
++		dec.StagnantFor, dec.Execs, dec.NewSignal, dec.StableSignal,
++		dec.NewInputs, dec.Hangs, dec.Failures, dec.Restarts, dec.Crashes,
++		dec.UniqueCrashes, dec.StateNovelty, dec.StateEvents, dec.StateNoveltyRate,
++		dec.StateValue, dec.StateAge, dec.StateDigest, dec.SoftResets,
++		dec.SnapshotName)
++}
++
++// String returns the human-readable name of a restart action.
++func (act RestartAct) String() string {
++	switch act {
++	case RestartContinue:
++		return "continue"
++	case RestartCheckpoint:
++		return "checkpoint"
++	case RestartSoft:
++		return "snapshot-restore"
++	case RestartHard:
++		return "hard-reset"
++	default:
++		return "unknown"
++	}
++}
++
++type RestartPolicy struct {
++	decisionMode            string
++	minLease                time.Duration
++	maxLease                time.Duration
++	hardMax                 time.Duration
++	stall                   time.Duration
++	evaluation              time.Duration
++	maxSoftResets           int
++	throughputDropPct       uint64
++	unhealthy               uint64
++	snapshotBankSize        int
++	statePromotionThreshold uint64
++	maxConcurrentActions    int
++	lineageCrashRecovery    bool
++}
++
++// makeAdaptiveRestartPolicy converts manager configuration into runtime policy values.
++func makeAdaptiveRestartPolicy(cfg mgrconfig.AdaptiveRestartConfig, vmCount int) RestartPolicy {
++	maxConcurrent := cfg.MaxConcurrentActions
++	if maxConcurrent == 0 {
++		maxConcurrent = max(1, vmCount/4)
++	}
++	snapshotBankSize := 0
++	if cfg.SnapshotBankSize != nil {
++		snapshotBankSize = *cfg.SnapshotBankSize
++	}
++	return RestartPolicy{
++		decisionMode:            cfg.DecisionMode,
++		minLease:                time.Duration(cfg.MinMinutes) * time.Minute,
++		maxLease:                time.Duration(cfg.MaxMinutes) * time.Minute,
++		hardMax:                 time.Duration(cfg.HardMaxMinutes) * time.Minute,
++		stall:                   time.Duration(cfg.StallMinutes) * time.Minute,
++		evaluation:              time.Duration(cfg.EvaluationSeconds) * time.Second,
++		maxSoftResets:           cfg.MaxSoftResets,
++		throughputDropPct:       uint64(cfg.ThroughputDropPercent),
++		unhealthy:               uint64(cfg.UnhealthyThreshold),
++		snapshotBankSize:        snapshotBankSize,
++		statePromotionThreshold: uint64(cfg.StatePromotionThreshold),
++		maxConcurrentActions:    maxConcurrent,
++		lineageCrashRecovery:    cfg.CrashRecovery == "lineage",
++	}
++}
++
++type Feedback struct {
++	execs         atomic.Uint64
++	newSignal     atomic.Uint64
++	stableSignal  atomic.Uint64
++	newInputs     atomic.Uint64
++	hangs         atomic.Uint64
++	failures      atomic.Uint64
++	restarts      atomic.Uint64
++	crashes       atomic.Uint64
++	uniqueCrashes atomic.Uint64
++	lastProgress  atomic.Int64
++	state         stateSketch
++}
++
++type feedbackSnapshot struct {
++	execs         uint64
++	newSignal     uint64
++	stableSignal  uint64
++	newInputs     uint64
++	hangs         uint64
++	failures      uint64
++	restarts      uint64
++	crashes       uint64
++	uniqueCrashes uint64
++	stateNovelty  uint64
++	stateEvents   uint64
++}
++
++// delta returns the feedback accumulated since a previous cumulative snapshot.
++func (fs feedbackSnapshot) delta(prev feedbackSnapshot) feedbackSnapshot {
++	return feedbackSnapshot{
++		execs:         fs.execs - prev.execs,
++		newSignal:     fs.newSignal - prev.newSignal,
++		stableSignal:  fs.stableSignal - prev.stableSignal,
++		newInputs:     fs.newInputs - prev.newInputs,
++		hangs:         fs.hangs - prev.hangs,
++		failures:      fs.failures - prev.failures,
++		restarts:      fs.restarts - prev.restarts,
++		crashes:       fs.crashes - prev.crashes,
++		uniqueCrashes: fs.uniqueCrashes - prev.uniqueCrashes,
++		stateNovelty:  fs.stateNovelty - prev.stateNovelty,
++		stateEvents:   fs.stateEvents - prev.stateEvents,
++	}
++}
++
++type VMState struct {
++	value       float64
++	lastNovelty uint64
++	pending     *learningSample
++	bank        snapshotBank
++	// Intermediate snapshots whose saved state the live kernel state extends.
++	lineage        []string
++	actionInFlight bool
++	stateStarted   time.Time
++}
++
++// Controller owns the adaptive restart policy for a VM pool.
++type Controller struct {
++	policy   RestartPolicy
++	feedback []Feedback
++	states   []*VMState
++	random   []random
++	learner  *linearUCB
++
++	mu          sync.Mutex
++	inFlight    int
++	seenCrashes map[string]struct{}
++
++	statSoftReset           *stat.Val
++	statHardReset           *stat.Val
++	statCheckpoint          *stat.Val
++	statOnlineDecision      *stat.Val
++	statOnlineEval          *stat.Val
++	statActionDeferred      *stat.Val
++	statModelUpdate         *stat.Val
++	statActionFailure       *stat.Val
++	statCheckpointCredit    *stat.Val
++	statIntermediateRestore *stat.Val
++	statSnapshotEviction    *stat.Val
++	statReward              *stat.Val
++	statStalled             *stat.Val
++	statThroughput          *stat.Val
++	statUnhealthy           *stat.Val
++	statLeaseLimit          *stat.Val
++	statVMLifetime          *stat.Val
++	statRestoreLimit        *stat.Val
++	statCrashRecovery       *stat.Val
++	statCrashIntermediate   *stat.Val
++	statRunEnded            *stat.Val
++}
++
++type random struct {
++	mu  sync.Mutex
++	rnd *rand.Rand
++}
++
++// NewController creates an adaptive restart controller for a VM pool.
++func NewController(cfg mgrconfig.AdaptiveRestartConfig, vmCount int) *Controller {
++	seed := time.Now().UnixNano()
++	random := make([]random, vmCount)
++	states := make([]*VMState, vmCount)
++	for vm := range random {
++		random[vm].rnd = rand.New(rand.NewSource(seed + int64(vm+1)*1_000_003))
++		states[vm] = &VMState{stateStarted: time.Now()}
++	}
++	newResetStat := func(name, description string) *stat.Val {
++		return stat.New(name, description, stat.Rate{}, stat.Graph("adaptive resets"))
++	}
++	controller := &Controller{
++		policy:             makeAdaptiveRestartPolicy(cfg, vmCount),
++		feedback:           make([]Feedback, vmCount),
++		states:             states,
++		random:             random,
++		learner:            newLinearUCB(float64(cfg.BanditExplorationPercent)/100, float64(cfg.LearningDiscountPercent)/100),
++		seenCrashes:        make(map[string]struct{}),
++		statSoftReset:      newResetStat("adaptive soft resets", "Snapshot restores requested by the adaptive policy"),
++		statHardReset:      newResetStat("adaptive hard resets", "Full VM reboots requested by the adaptive policy"),
++		statCheckpoint:     newResetStat("adaptive checkpoints", "Intermediate state snapshots promoted by the adaptive policy"),
++		statOnlineDecision: newResetStat("adaptive online decisions", "Actions selected by the online policy"),
++		statOnlineEval:     newResetStat("adaptive evaluations", "Decision windows evaluated by the adaptive controller"),
++		statActionDeferred: newResetStat("adaptive action deferred", "Adaptive actions deferred by the concurrency limit"),
++		statModelUpdate:    newResetStat("adaptive model updates", "Rewards applied to the online decision model"),
++		statActionFailure: newResetStat("adaptive action failures",
++			"Failed snapshot actions or unexpected VM replacements"),
++		statCheckpointCredit: newResetStat("adaptive checkpoint credits",
++			"Delayed rewards attributed to checkpoint creation after intermediate snapshot reuse"),
++		statIntermediateRestore: newResetStat("adaptive intermediate restores",
++			"Intermediate snapshot restores requested by the adaptive policy"),
++		statSnapshotEviction: newResetStat("adaptive snapshot evictions",
++			"Intermediate snapshots evicted from full per-VM banks"),
++		statReward: stat.New("adaptive reward", "Mean online-policy reward multiplied by 100",
++			stat.Distribution{}, stat.NoGraph),
++		statStalled:      newResetStat("adaptive reset stalled", "Adaptive resets caused by feedback stalls"),
++		statThroughput:   newResetStat("adaptive reset throughput", "Adaptive resets caused by throughput degradation"),
++		statUnhealthy:    newResetStat("adaptive reset unhealthy", "Adaptive resets caused by a high hang or failure rate"),
++		statLeaseLimit:   newResetStat("adaptive reset lease limit", "Adaptive resets caused by lease limits"),
++		statVMLifetime:   newResetStat("adaptive reset vm lifetime", "Adaptive resets caused by VM lifetime limits"),
++		statRestoreLimit: newResetStat("adaptive reset restore limit", "Adaptive resets caused by snapshot restore limits"),
++		statCrashRecovery: newResetStat("adaptive reset crash recovery",
++			"Mandatory snapshot restores after a kernel crash"),
++		statCrashIntermediate: newResetStat("adaptive crash recovery intermediate",
++			"Crash recoveries that restored an intermediate snapshot outside the crashed state's lineage"),
++		statRunEnded: newResetStat("adaptive reset run ended",
++			"Mandatory snapshot restores after a fuzzing run ended without a policy action"),
++	}
++	stat.New("adaptive snapshot bank entries", "Number of retained intermediate state snapshots",
++		stat.NoGraph, func() int {
++			controller.mu.Lock()
++			defer controller.mu.Unlock()
++			count := 0
++			for _, state := range controller.states {
++				count += len(state.bank.entries)
++			}
++			return count
++		})
++	stat.New("adaptive state novelty", "Total recent behavioral-state cache misses",
++		stat.NoGraph, func() int {
++			var total uint64
++			for index := range controller.feedback {
++				total += controller.feedback[index].state.novelty.Load()
++			}
++			return int(total)
++		})
++	stat.New("adaptive state events", "Total behavioral-state digests observed",
++		stat.NoGraph, func() int {
++			var total uint64
++			for index := range controller.feedback {
++				total += controller.feedback[index].state.events.Load()
++			}
++			return int(total)
++		})
++	stat.New("adaptive mean state value", "Mean current VM state value multiplied by 100",
++		stat.NoGraph, func() int {
++			controller.mu.Lock()
++			defer controller.mu.Unlock()
++			if len(controller.states) == 0 {
++				return 0
++			}
++			var total float64
++			for _, state := range controller.states {
++				total += state.value
++			}
++			return int(total * 100 / float64(len(controller.states)))
++		})
++	return controller
++}
++
++// Record adds VM-local fuzzing feedback to the controller's cumulative counters.
++func (c *Controller) Record(feedback fuzzer.VMFeedback) {
++	if feedback.VM < 0 || feedback.VM >= len(c.feedback) {
++		return
++	}
++	counter := &c.feedback[feedback.VM]
++	counter.execs.Add(feedback.Executions)
++	counter.newSignal.Add(feedback.NewSignal)
++	counter.stableSignal.Add(feedback.StableSignal)
++	counter.newInputs.Add(feedback.NewInputs)
++	counter.hangs.Add(feedback.Hangs)
++	counter.failures.Add(feedback.Failures)
++	counter.restarts.Add(feedback.Restarts)
++	counter.state.record(feedback.StateDigest, feedback.StateEvents)
++	// Asynchronous triage feedback can arrive after another lease has begun.
++	if feedback.NewSignal != 0 || feedback.StableSignal != 0 || feedback.NewInputs != 0 {
++		counter.lastProgress.Store(time.Now().UnixNano())
++	}
++}
++
++// RecordCrash records a crash and marks its title as useful progress when it is
++// the first useful occurrence in the campaign.
++func (c *Controller) RecordCrash(vm int, title string, useful bool) {
++	if vm < 0 || vm >= len(c.feedback) {
++		return
++	}
++	c.feedback[vm].crashes.Add(1)
++	if title == "" || !useful {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if _, exists := c.seenCrashes[title]; !exists {
++		c.seenCrashes[title] = struct{}{}
++		c.feedback[vm].uniqueCrashes.Add(1)
++		c.feedback[vm].lastProgress.Store(time.Now().UnixNano())
++	}
++}
++
++// snapshot returns an atomic cumulative view of one VM's feedback counters.
++func (c *Controller) snapshot(vm int) feedbackSnapshot {
++	counter := &c.feedback[vm]
++	return feedbackSnapshot{
++		execs:         counter.execs.Load(),
++		newSignal:     counter.newSignal.Load(),
++		stableSignal:  counter.stableSignal.Load(),
++		newInputs:     counter.newInputs.Load(),
++		hangs:         counter.hangs.Load(),
++		failures:      counter.failures.Load(),
++		restarts:      counter.restarts.Load(),
++		crashes:       counter.crashes.Load(),
++		uniqueCrashes: counter.uniqueCrashes.Load(),
++		stateNovelty:  counter.state.novelty.Load(),
++		stateEvents:   counter.state.events.Load(),
++	}
++}
++
++// RegisterCleanSnapshot registers a usable VM and its clean snapshot, accounts
++// for boot cost, and resets the VM-local snapshot bank and state model.
++func (c *Controller) RegisterCleanSnapshot(vm int, bootCost time.Duration) {
++	if vm < 0 || vm >= len(c.states) {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	state := c.states[vm]
++	if state.pending != nil && state.pending.action != RestartHard && !state.pending.attempted {
++		// The VM disappeared before the selected non-hard action was attempted.
++		// Treat the sample as censored instead of training the action as a
++		// failure caused by an unrelated infrastructure restart.
++		state.pending = nil
++	}
++	if state.pending != nil {
++		if state.pending.action != RestartHard && !state.pending.failed {
++			state.pending.failed = true
++			if c.statActionFailure != nil {
++				c.statActionFailure.Add(1)
++			}
++		}
++		state.pending.attempted = true
++		state.pending.cost += bootCost
++		// Feedback that arrived before the replacement VM became usable belongs
++		// to the preceding state, not to the rebooted state's outcome.
++		state.pending.baseline = c.snapshot(vm)
++		// A hard reset destroys every snapshot in the old per-VM bank. Keep the
++		// action sample for online learning, but never attribute its outcome to a
++		// newly created snapshot that happens to reuse the same name.
++		state.pending.snapshot = ""
++	}
++	c.completeInFlightLocked(state)
++	state.bank.reset(CleanSnapshotName, time.Now())
++	state.lineage = nil
++	state.value = 0
++	state.lastNovelty = 0
++	state.stateStarted = time.Now()
++	c.feedback[vm].state.restore(stateFingerprint{})
++}
++
++// CompleteAction records an attempted action's cost and result, then applies
++// successful checkpoint or restore metadata to the VM state.
++func (c *Controller) CompleteAction(vm int, dec RestartDecision, cost time.Duration, succ bool) {
++	if vm < 0 || vm >= len(c.states) {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	state := c.states[vm]
++	var promotionFeatures features
++	promotionLearn := false
++	if state.pending != nil && state.pending.action == RestartCheckpoint {
++		promotionFeatures = state.pending.features
++		promotionLearn = state.pending.learn
++	}
++	if !succ && c.statActionFailure != nil {
++		c.statActionFailure.Add(1)
++	}
++	if state.pending != nil {
++		state.pending.attempted = true
++		state.pending.cost += cost
++		if !succ {
++			state.pending.failed = true
++		}
++		// Exclude asynchronous feedback produced before the selected action was
++		// actually applied. The next observation now measures the post-action
++		// state while elapsed time and cost still capture its opportunity cost.
++		state.pending.baseline = c.snapshot(vm)
++	}
++	c.completeInFlightLocked(state)
++	if !succ {
++		return
++	}
++	switch dec.Action {
++	case RestartCheckpoint:
++		fingerprint := dec.fingerprint
++		if vm < len(c.feedback) {
++			// Feedback can arrive while the runner is stopping and the QEMU
++			// snapshot is being saved. Record the fingerprint closest to the
++			// actual saved state rather than the earlier decision-time state.
++			fingerprint = c.feedback[vm].state.snapshot()
++		}
++		state.bank.remove(dec.DeleteSnapshot)
++		if dec.DeleteSnapshot != "" && c.statSnapshotEviction != nil {
++			c.statSnapshotEviction.Add(1)
++		}
++		state.bank.append(Snapshot{
++			name:              dec.SnapshotName,
++			created:           time.Now(),
++			stateAge:          dec.StateAge,
++			fingerprint:       fingerprint,
++			value:             dec.StateValue,
++			novelty:           dec.noveltyScore,
++			promotionFeatures: promotionFeatures,
++			promotionLearn:    promotionLearn,
++			ancestors:         slices.Clone(state.lineage),
++		})
++		// The VM keeps running the checkpointed state, so everything it does
++		// from now on extends the new snapshot.
++		state.lineage = append(state.lineage, dec.SnapshotName)
++	case RestartSoft:
++		snapshot := state.bank.find(dec.SnapshotName)
++		if snapshot != nil {
++			snapshot.uses++
++			state.value = snapshot.value
++			state.lastNovelty = snapshot.novelty
++			if snapshot.name == state.bank.clean.name {
++				// Restoring clean creates a fresh kernel state. Reusing the
++				// clean snapshot's creation time would make the reset state look
++				// increasingly old to the state-age model.
++				state.stateStarted = time.Now()
++			} else {
++				// Resume the active state lifetime saved with the snapshot. Time
++				// spent frozen in the bank must not make kernel state appear
++				// deeper or longer-lived.
++				state.stateStarted = time.Now().Add(-snapshot.stateAge)
++			}
++			state.lineage = snapshot.lineage()
++			c.feedback[vm].state.restore(snapshot.fingerprint)
++		}
++	}
++}
++
++// ForcedHardReset prepares the controller for a VM replacement while preserving
++// an attributable hard-reset sample until the replacement becomes usable.
++func (c *Controller) ForcedHardReset(vm int) {
++	if vm < 0 || vm >= len(c.states) {
++		return
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	state := c.states[vm]
++	if state.pending != nil {
++		switch {
++		case state.pending.action == RestartHard:
++			// Keep a selected hard-reset sample alive until the replacement VM
++			// registers its clean snapshot. Otherwise the online learner never
++			// observes reboot cost or the resulting fresh state.
++			state.pending.attempted = true
++		case state.pending.attempted:
++			c.finishLearningSampleLocked(state, c.snapshot(vm), time.Now())
++		default:
++			state.pending = nil
++		}
++	}
++	if !state.actionInFlight {
++		state.actionInFlight = true
++		c.inFlight++
++	}
++}
++
++// RecoveryDecision closes the preceding observation and returns the mandatory
++// snapshot restore used after a crash or otherwise ended fuzzing run. A crashed
++// state is never restored into a snapshot it descends from: the corruption may
++// predate the crash report and already be present in those snapshots.
++func (c *Controller) RecoveryDecision(vm int, crashed bool) RestartDecision {
++	if vm < 0 || vm >= len(c.states) {
++		return RestartDecision{Action: RestartSoft, SnapshotName: CleanSnapshotName}
++	}
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	state := c.states[vm]
++	now := time.Now()
++	current := c.snapshot(vm)
++	// Close the previous action's observation before the mandatory recovery.
++	// The post-restore reward must describe the selected snapshot, not be mixed
++	// into the action that happened to precede the ended fuzzing run.
++	c.finishLearningSampleLocked(state, current, now)
++	fingerprint := c.feedback[vm].state.snapshot()
++	rnd := c.randomFloat(vm)
++	snapshot := state.bank.selectRandom(nil, rnd)
++	if crashed {
++		snapshot = &state.bank.clean
++		if c.policy.lineageCrashRecovery {
++			snapshot = state.bank.selectRandom(state.lineage, rnd)
++		}
++	}
++	dec := RestartDecision{
++		Action:           RestartSoft,
++		Reason:           RestartReasonRunEnded,
++		StateValue:       state.value,
++		StateDigest:      fingerprint.digest(),
++		SnapshotName:     snapshot.name,
++		fingerprint:      fingerprint,
++		StateNoveltyRate: float64(state.lastNovelty),
++		noveltyScore:     state.lastNovelty,
++	}
++	if !state.actionInFlight {
++		state.actionInFlight = true
++		c.inFlight++
++	}
++	if crashed {
++		dec.Reason = RestartReasonCrashRecovery
++	}
++	state.pending = &learningSample{
++		action:   RestartSoft,
++		baseline: current,
++		started:  now,
++		snapshot: snapshot.name,
++	}
++	return dec
++}
++
++// completeInFlightLocked releases an action reservation. The caller must hold c.mu.
++func (c *Controller) completeInFlightLocked(state *VMState) {
++	if state.actionInFlight {
++		state.actionInFlight = false
++		c.inFlight--
++	}
++}
++
++// peerLastProgress returns the latest useful-progress time reported by another VM.
++func (c *Controller) peerLastProgress(vm int) time.Time {
++	var latest int64
++	for index := range c.feedback {
++		if index == vm {
++			continue
++		}
++		latest = max(latest, c.feedback[index].lastProgress.Load())
++	}
++	return time.Unix(0, latest)
++}
++
++// leaseLimit returns a randomized lease limit bounded by the configured minimum.
++func (c *Controller) leaseLimit(vm int) time.Duration {
++	jitter := 0.75 + c.randomFloat(vm)*0.25
++	return max(c.policy.minLease, time.Duration(float64(c.policy.maxLease)*jitter))
++}
++
++// HardMax returns the maximum duration for one VM lifetime.
++func (c *Controller) HardMax() time.Duration {
++	return c.policy.hardMax
++}
++
++// randomFloat returns the next concurrency-safe pseudo-random value for one VM.
++func (c *Controller) randomFloat(vm int) float64 {
++	if vm < 0 || vm >= len(c.random) {
++		return rand.Float64()
++	}
++	random := &c.random[vm]
++	random.mu.Lock()
++	defer random.mu.Unlock()
++	return random.rnd.Float64()
++}
++
++// StartLease starts monitoring one fuzzing lease and returns its context, stop
++// function, and channel for the first disruptive decision.
++func (c *Controller) StartLease(parent context.Context, vm int, vmStarted time.Time,
++	softResets int) (context.Context, func(), <-chan RestartDecision) {
++	ctx, cancel := context.WithCancel(parent)
++	decisions := make(chan RestartDecision, 1)
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		c.monitor(ctx, cancel, decisions, vm, vmStarted, softResets)
++	}()
++	stop := func() {
++		cancel()
++		<-done
++	}
++	return ctx, stop, decisions
++}
++
++// BeforeLease enforces VM-lifetime safety boundaries before starting a lease.
++func (c *Controller) BeforeLease(vm int, vmStarted time.Time, softResets int) RestartDecision {
++	return c.boundaryDecision(vm, vmStarted, softResets, false)
++}
++
++// AfterLease enforces VM-lifetime and restore-count safety boundaries after a lease.
++func (c *Controller) AfterLease(vm int, vmStarted time.Time, softResets int) RestartDecision {
++	return c.boundaryDecision(vm, vmStarted, softResets, true)
++}
++
++// boundaryDecision evaluates configured safety boundaries and reserves a
++// required hard reset when concurrency capacity permits.
++func (c *Controller) boundaryDecision(vm int, vmStarted time.Time, softResets int,
++	enforceRestoreLimit bool) RestartDecision {
++	now := time.Now()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++
++	state := c.states[vm]
++	dec := RestartDecision{
++		VMAge:      now.Sub(vmStarted),
++		SoftResets: softResets,
++	}
++	if dec.VMAge >= c.policy.hardMax {
++		dec.Action = RestartHard
++		dec.Reason = RestartReasonVMLifetime
++	} else if enforceRestoreLimit && softResets >= c.policy.maxSoftResets {
++		dec.Action = RestartHard
++		dec.Reason = RestartReasonTooManyRestores
++	}
++	if c.reserveActionLocked(state, &dec) && dec.Action == RestartHard {
++		c.startBoundaryHardResetLocked(vm, state, dec, now)
++	}
++	return dec
++}
++
++// startBoundaryHardResetLocked starts accounting for a safety-mandated hard
++// reset without training the online policy. The caller must hold c.mu.
++func (c *Controller) startBoundaryHardResetLocked(vm int, state *VMState, dec RestartDecision, now time.Time) {
++	if state.pending != nil && state.pending.action == RestartHard {
++		return
++	}
++	current := c.snapshot(vm)
++	if state.pending != nil {
++		if state.pending.attempted {
++			c.finishLearningSampleLocked(state, current, now)
++		} else {
++			state.pending = nil
++		}
++	}
++	// Boundary resets are safety actions, so they are measured for action cost,
++	// snapshot quality and observability but do not train the online
++	// policy as if it selected the reset.
++	c.startLearningSampleLocked(state, dec, features{}, current, now)
++}
++
++// monitor evaluates periodic feedback windows until the lease is stopped or a
++// disruptive decision is emitted.
++func (c *Controller) monitor(ctx context.Context, cancel context.CancelFunc,
++	decisions chan<- RestartDecision, vm int, vmStarted time.Time, softResets int) {
++	leaseStarted := time.Now()
++	lastProgress := leaseStarted
++	previous := c.snapshot(vm)
++	leaseLimit := c.leaseLimit(vm)
++	var bestExecs uint64
++	lowThroughputWindows := 0
++	ticker := time.NewTicker(c.policy.evaluation)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case now := <-ticker.C:
++			current := c.snapshot(vm)
++			window := current.delta(previous)
++			previous = current
++			if window.newSignal != 0 {
++				lastProgress = now
++			} else if progress := c.feedback[vm].lastProgress.Load(); progress > lastProgress.UnixNano() {
++				lastProgress = time.Unix(0, progress)
++			}
++			if window.execs > bestExecs {
++				bestExecs = window.execs
++			}
++			keepPercent := uint64(100) - c.policy.throughputDropPct
++			if bestExecs != 0 && window.execs*100 < bestExecs*keepPercent {
++				lowThroughputWindows++
++			} else {
++				lowThroughputWindows = 0
++			}
++			dec := c.decide(vm, restartObservation{
++				now:                  now,
++				vmStarted:            vmStarted,
++				leaseStarted:         leaseStarted,
++				lastProgress:         lastProgress,
++				peerLastProgress:     c.peerLastProgress(vm),
++				leaseLimit:           leaseLimit,
++				softResets:           softResets,
++				lowThroughputWindows: lowThroughputWindows,
++				bestExecs:            bestExecs,
++				window:               window,
++			}, current)
++			if dec.Action == RestartContinue {
++				continue
++			}
++			decisions <- dec
++			cancel()
++			return
++		}
++	}
++}
++
++type restartObservation struct {
++	now                  time.Time
++	vmStarted            time.Time
++	leaseStarted         time.Time
++	lastProgress         time.Time
++	peerLastProgress     time.Time
++	leaseLimit           time.Duration
++	softResets           int
++	lowThroughputWindows int
++	bestExecs            uint64
++	window               feedbackSnapshot
++	random               float64
++	stateValue           float64
++	stateAge             time.Duration
++	fingerprint          stateFingerprint
++}
++
++// decide completes the prior learning sample, updates state value, and selects
++// the next action for an observation window.
++func (c *Controller) decide(vm int, obs restartObservation, current feedbackSnapshot) RestartDecision {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	state := c.states[vm]
++	if c.statOnlineEval != nil {
++		c.statOnlineEval.Add(1)
++	}
++	c.finishLearningSampleLocked(state, current, obs.now)
++	state.lastNovelty = stateNoveltyScore(obs.window)
++	if state.stateStarted.IsZero() {
++		state.stateStarted = obs.vmStarted
++	}
++	state.value = 0.8*state.value + 0.2*instantStateValue(obs.window)
++	if obs.leaseLimit <= 0 || obs.leaseLimit > c.policy.maxLease {
++		// Enforce the configured state lease budget.
++		obs.leaseLimit = c.policy.maxLease
++	}
++	obs.stateValue = state.value
++	obs.stateAge = obs.now.Sub(state.stateStarted)
++	obs.fingerprint = c.feedback[vm].state.snapshot()
++	obs.random = c.randomFloat(vm)
++
++	dec := decisionFromObservation(obs)
++	switch {
++	case dec.VMAge >= c.policy.hardMax:
++		dec.Action, dec.Reason = RestartHard, RestartReasonVMLifetime
++	case dec.LeaseAge < c.policy.minLease:
++		dec.Action = RestartContinue
++	case obs.softResets >= c.policy.maxSoftResets:
++		// Let a just-restored state produce at least one useful observation
++		// window before enforcing the restore-count boundary.
++		dec.Action, dec.Reason = RestartHard, RestartReasonTooManyRestores
++	case unhealthyWindow(obs.window, c.policy.unhealthy):
++		dec.Action, dec.Reason = RestartSoft, RestartReasonUnhealthy
++	case c.policy.decisionMode == "heuristic":
++		dec = evaluateAdaptiveRestart(obs, c.policy)
++		if dec.Action == RestartContinue && c.canPromoteHeuristicLocked(vm, obs) {
++			dec.Action, dec.Reason = RestartCheckpoint, RestartReasonStatePromotion
++		}
++	default:
++		dec = c.onlineDecisionLocked(vm, obs)
++	}
++	c.prepareActionLocked(vm, &dec)
++	c.startLearningSampleLocked(state, dec, adaptiveFeaturesFor(obs), current, obs.now)
++	return dec
++}
++
++// instantStateValue estimates the current kernel state's utility from one feedback window.
++func instantStateValue(window feedbackSnapshot) float64 {
++	progress := 2*math.Log1p(float64(window.newSignal)) +
++		5*math.Log1p(float64(window.stableSignal)) +
++		8*float64(window.newInputs) +
++		1.5*math.Log1p(stateNoveltyRate(window)) +
++		25*float64(window.uniqueCrashes)
++	repeatedCrashes := repeatedCrashCount(window)
++	penalty := 3*float64(window.hangs+window.failures) + float64(repeatedCrashes)
++	return progress + math.Log1p(float64(window.execs))/10 - penalty
++}
++
++// unhealthyWindow reports whether hangs and failures reach the configured execution ratio.
++func unhealthyWindow(window feedbackSnapshot, thresholdPercent uint64) bool {
++	if window.execs == 0 {
++		return false
++	}
++	return (window.hangs+window.failures)*100 >= window.execs*thresholdPercent
++}
++
++// decisionFromObservation copies an observation into a decision context without selecting an action.
++func decisionFromObservation(obs restartObservation) RestartDecision {
++	return RestartDecision{
++		LeaseAge:         obs.now.Sub(obs.leaseStarted),
++		VMAge:            obs.now.Sub(obs.vmStarted),
++		StagnantFor:      obs.now.Sub(obs.lastProgress),
++		Execs:            obs.window.execs,
++		NewSignal:        obs.window.newSignal,
++		StableSignal:     obs.window.stableSignal,
++		NewInputs:        obs.window.newInputs,
++		Hangs:            obs.window.hangs,
++		Failures:         obs.window.failures,
++		Restarts:         obs.window.restarts,
++		Crashes:          obs.window.crashes,
++		UniqueCrashes:    obs.window.uniqueCrashes,
++		StateNovelty:     obs.window.stateNovelty,
++		StateEvents:      obs.window.stateEvents,
++		StateNoveltyRate: stateNoveltyRate(obs.window),
++		StateValue:       obs.stateValue,
++		StateAge:         obs.stateAge,
++		StateDigest:      obs.fingerprint.digest(),
++		SoftResets:       obs.softResets,
++		fingerprint:      obs.fingerprint,
++		noveltyScore:     stateNoveltyScore(obs.window),
++	}
++}
++
++// stateNoveltyScore returns the rounded number of novelty events per thousand state events.
++func stateNoveltyScore(window feedbackSnapshot) uint64 {
++	return uint64(math.Round(stateNoveltyRate(window)))
++}
++
++// onlineDecisionLocked builds the eligible action set and selects an action
++// with the online learner. The caller must hold c.mu.
++func (c *Controller) onlineDecisionLocked(vm int, obs restartObservation) RestartDecision {
++	dec := decisionFromObservation(obs)
++	actions := []RestartAct{RestartContinue, RestartSoft}
++	if c.canPromoteLocked(vm, obs) {
++		actions = append(actions, RestartCheckpoint)
++	}
++	if dec.VMAge >= c.policy.maxLease ||
++		obs.softResets >= max(1, c.policy.maxSoftResets/2) {
++		actions = append(actions, RestartHard)
++	}
++	dec.Action = c.learner.selectAction(adaptiveFeaturesFor(obs), actions, obs.random)
++	dec.Reason = RestartReasonOnlinePolicy
++	if dec.Action == RestartCheckpoint {
++		dec.Reason = RestartReasonStatePromotion
++	}
++	if c.statOnlineDecision != nil {
++		c.statOnlineDecision.Add(1)
++	}
++	return dec
++}
++
++// promotionCandidateLocked returns the VM's snapshot bank when the observed
++// state satisfies the basic duplicate-free promotion requirements. The caller
++// must hold c.mu.
++func (c *Controller) promotionCandidateLocked(vm int, obs restartObservation) (*snapshotBank, bool) {
++	if vm < 0 || vm >= len(c.states) ||
++		c.policy.snapshotBankSize <= 0 ||
++		obs.fingerprint.count() == 0 {
++		return nil, false
++	}
++	bank := &c.states[vm].bank
++	if bank.containsFingerprint(obs.fingerprint) {
++		return nil, false
++	}
++	return bank, true
++}
++
++// canPromoteHeuristicLocked reports whether the strict heuristic novelty
++// threshold permits promotion. The caller must hold c.mu.
++func (c *Controller) canPromoteHeuristicLocked(vm int, obs restartObservation) bool {
++	_, candidate := c.promotionCandidateLocked(vm, obs)
++	return candidate && obs.window.stateNovelty >= c.policy.statePromotionThreshold
++}
++
++// canPromoteLocked reports whether the online policy may consider checkpoint
++// promotion based on novelty or useful behavioral distance. The caller must hold c.mu.
++func (c *Controller) canPromoteLocked(vm int, obs restartObservation) bool {
++	bank, candidate := c.promotionCandidateLocked(vm, obs)
++	if !candidate {
++		return false
++	}
++	if obs.window.stateNovelty >= c.policy.statePromotionThreshold {
++		return true
++	}
++	// A campaign-local novelty cache eventually recognizes most recurring
++	// behavior. Keep the bank reachable after that point by admitting states
++	// that made useful progress and are behaviorally distinct from every
++	// retained intermediate snapshot. The learner still decides whether the
++	// checkpoint's measured cost is worthwhile.
++	return usefulStateProgress(obs.window) &&
++		bank.closestDistance(obs.fingerprint) >= statePromotionMinDistance
++}
++
++// usefulStateProgress reports whether a window produced useful fuzzing progress.
++func usefulStateProgress(window feedbackSnapshot) bool {
++	return window.newSignal != 0 || window.stableSignal != 0 ||
++		window.newInputs != 0 || window.uniqueCrashes != 0
++}
++
++// adaptiveFeaturesFor converts an observation into the normalized Linear-UCB context vector.
++func adaptiveFeaturesFor(obs restartObservation) features {
++	healthRate := 0.0
++	if obs.window.execs != 0 {
++		// A hang commonly causes an executor restart, so use the larger count
++		// rather than charging the same disruption twice.
++		disruptions := obs.window.failures + max(obs.window.hangs, obs.window.restarts)
++		healthRate = 1000 * float64(disruptions) / float64(obs.window.execs)
++	}
++	throughputRatio := 1.0
++	if obs.bestExecs != 0 {
++		throughputRatio = float64(obs.window.execs) / float64(obs.bestExecs)
++	}
++	return features{
++		1,
++		clampFloat(float64(obs.now.Sub(obs.leaseStarted))/float64(max(time.Second, obs.leaseLimit)), 0, 3),
++		clampFloat(float64(obs.now.Sub(obs.vmStarted))/float64(max(time.Second, obs.leaseLimit)), 0, 6),
++		clampFloat(float64(obs.now.Sub(obs.lastProgress))/float64(max(time.Second, obs.leaseLimit)), 0, 6),
++		math.Log1p(float64(obs.window.execs)) / 20,
++		clampFloat(throughputRatio, 0, 2),
++		math.Log1p(float64(obs.window.newSignal)) / 5,
++		math.Log1p(float64(obs.window.stableSignal)) / 5,
++		math.Log1p(float64(obs.window.newInputs)) / 3,
++		math.Log1p(healthRate) / 3,
++		clampFloat(float64(obs.softResets)/8, 0, 2),
++		boolFloat(obs.peerLastProgress.After(obs.lastProgress)),
++		math.Log1p(stateNoveltyRate(obs.window)) / 5,
++		math.Tanh(obs.fingerprint.depth() / 8),
++		math.Tanh(obs.stateValue / 20),
++		clampFloat(float64(obs.stateAge)/float64(max(time.Second, controllerStateAgeScale(obs))), 0, 6),
++	}
++}
++
++// controllerStateAgeScale returns the lease-relative scale used to normalize state age.
++func controllerStateAgeScale(obs restartObservation) time.Duration {
++	if obs.leaseLimit > 0 {
++		return obs.leaseLimit
++	}
++	return time.Hour
++}
++
++// boolFloat converts a boolean feature to zero or one.
++func boolFloat(value bool) float64 {
++	if value {
++		return 1
++	}
++	return 0
++}
++
++// clampFloat bounds a floating-point value to the inclusive interval.
++func clampFloat(value, low, high float64) float64 {
++	return min(high, max(low, value))
++}
++
++// prepareActionLocked reserves a disruptive action and fills its snapshot
++// selection or promotion metadata. The caller must hold c.mu.
++func (c *Controller) prepareActionLocked(vm int, dec *RestartDecision) {
++	state := c.states[vm]
++	if !c.reserveActionLocked(state, dec) {
++		return
++	}
++	switch dec.Action {
++	case RestartSoft:
++		rnd := c.randomFloat(vm)
++		snapshot := state.bank.selectRandom(nil, rnd)
++		dec.SnapshotName = snapshot.name
++	case RestartCheckpoint:
++		state.bank.nextID++
++		dec.SnapshotName = fmt.Sprintf("state-%d-%d", vm, state.bank.nextID)
++		dec.DeleteSnapshot = state.bank.evictionCandidate(c.policy.snapshotBankSize)
++	}
++}
++
++// reserveActionLocked accepts an existing reservation, reserves concurrency
++// capacity for a disruptive action, or changes it to continue when the action
++// limit is reached. The caller must hold c.mu.
++func (c *Controller) reserveActionLocked(state *VMState, dec *RestartDecision) bool {
++	if dec.Action == RestartContinue || state.actionInFlight {
++		return true
++	}
++	if c.policy.maxConcurrentActions > 0 &&
++		c.inFlight >= c.policy.maxConcurrentActions {
++		dec.Action = RestartContinue
++		dec.Reason = RestartReasonActionLimit
++		if c.statActionDeferred != nil {
++			c.statActionDeferred.Add(1)
++		}
++		return false
++	}
++	state.actionInFlight = true
++	c.inFlight++
++	return true
++}
++
++// startLearningSampleLocked starts outcome attribution for a decision and marks
++// whether it may train the online learner. The caller must hold c.mu.
++func (c *Controller) startLearningSampleLocked(state *VMState, dec RestartDecision, feats features,
++	baseline feedbackSnapshot, now time.Time) {
++	state.pending = &learningSample{
++		action:   dec.Action,
++		features: feats,
++		baseline: baseline,
++		started:  now,
++		snapshot: dec.SnapshotName,
++		learn: c.policy.decisionMode == "bandit" &&
++			(dec.Reason == RestartReasonOnlinePolicy ||
++				dec.Reason == RestartReasonStatePromotion),
++		attempted: dec.Action == RestartContinue,
++	}
++}
++
++// finishLearningSampleLocked computes an attempted action's reward, updates the
++// learner and snapshot quality, and clears the sample. The caller must hold c.mu.
++func (c *Controller) finishLearningSampleLocked(state *VMState, current feedbackSnapshot, now time.Time) {
++	if state.pending == nil {
++		return
++	}
++	sample := state.pending
++	if !sample.attempted {
++		// A selected action can be superseded by a safety boundary before the
++		// manager attempts it. Such a censored action has no observable reward.
++		state.pending = nil
++		return
++	}
++	delta := current.delta(sample.baseline)
++	reward := Reward(delta, now.Sub(sample.started), sample.cost, sample.failed)
++	if c.policy.decisionMode == "bandit" && sample.learn {
++		c.learner.update(sample.action, sample.features, reward)
++		if c.statModelUpdate != nil {
++			c.statModelUpdate.Add(1)
++		}
++	}
++	if sample.snapshot != "" &&
++		(sample.action == RestartSoft || sample.action == RestartCheckpoint) {
++		if snapshot := state.bank.find(sample.snapshot); snapshot != nil {
++			snapshot.observe(reward)
++			if sample.action == RestartSoft && snapshot.promotionLearn &&
++				c.policy.decisionMode == "bandit" && c.learner != nil {
++				// Checkpoint utility is delayed until a retained state is reused.
++				// Feed that realized benefit back to the creation context instead
++				// of training checkpoint only on its immediate save cost.
++				c.learner.update(RestartCheckpoint, snapshot.promotionFeatures, reward)
++				if c.statModelUpdate != nil {
++					c.statModelUpdate.Add(1)
++				}
++				if c.statCheckpointCredit != nil {
++					c.statCheckpointCredit.Add(1)
++				}
++			}
++		}
++	}
++	if c.statReward != nil && sample.learn {
++		c.statReward.Add(int(reward * 100))
++	}
++	state.pending = nil
++}
++
++// evaluateAdaptiveRestart returns the threshold heuristic's action for an observation.
++func evaluateAdaptiveRestart(obs restartObservation, policy RestartPolicy) RestartDecision {
++	dec := decisionFromObservation(obs)
++	switch {
++	case dec.VMAge >= policy.hardMax:
++		dec.Action, dec.Reason = RestartHard, RestartReasonVMLifetime
++	case obs.softResets >= policy.maxSoftResets:
++		dec.Action, dec.Reason = RestartHard, RestartReasonTooManyRestores
++	case dec.LeaseAge < policy.minLease:
++	case unhealthyWindow(obs.window, policy.unhealthy):
++		dec.Action, dec.Reason = RestartSoft, RestartReasonUnhealthy
++	case obs.lowThroughputWindows >= 3:
++		dec.Action, dec.Reason = RestartSoft, RestartReasonThroughput
++	case dec.LeaseAge >= obs.leaseLimit:
++		dec.Action, dec.Reason = RestartSoft, RestartReasonLeaseLimit
++	case dec.StagnantFor < policy.stall:
++	default:
++		stallPeriods := float64(dec.StagnantFor) / float64(policy.stall)
++		probability := min(0.75, stallPeriods*0.10)
++		if obs.peerLastProgress.After(obs.lastProgress) {
++			probability = min(0.90, probability+0.25)
++		}
++		if stallPeriods >= 3 || obs.random < probability {
++			dec.Action, dec.Reason = RestartSoft, RestartReasonStalled
++		}
++	}
++	return dec
++}
++
++// RecordDecision increments action and reason statistics for an issued decision.
++func (c *Controller) RecordDecision(dec RestartDecision) {
++	switch dec.Action {
++	case RestartCheckpoint:
++		c.statCheckpoint.Add(1)
++	case RestartSoft:
++		c.statSoftReset.Add(1)
++		if dec.SnapshotName != "" && dec.SnapshotName != CleanSnapshotName {
++			c.statIntermediateRestore.Add(1)
++		}
++	case RestartHard:
++		c.statHardReset.Add(1)
++	}
++	switch dec.Reason {
++	case RestartReasonStalled:
++		c.statStalled.Add(1)
++	case RestartReasonThroughput:
++		c.statThroughput.Add(1)
++	case RestartReasonUnhealthy:
++		c.statUnhealthy.Add(1)
++	case RestartReasonLeaseLimit:
++		c.statLeaseLimit.Add(1)
++	case RestartReasonVMLifetime:
++		c.statVMLifetime.Add(1)
++	case RestartReasonTooManyRestores:
++		c.statRestoreLimit.Add(1)
++	case RestartReasonCrashRecovery:
++		c.statCrashRecovery.Add(1)
++		if dec.SnapshotName != "" && dec.SnapshotName != CleanSnapshotName {
++			c.statCrashIntermediate.Add(1)
++		}
++	case RestartReasonRunEnded:
++		c.statRunEnded.Add(1)
++	}
++}
+diff --git a/pkg/adaptive/restart_test.go b/pkg/adaptive/restart_test.go
+new file mode 100644
+index 000000000..1f9916a09
+--- /dev/null
++++ b/pkg/adaptive/restart_test.go
+@@ -0,0 +1,1203 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package adaptive
++
++import (
++	"context"
++	"math/rand"
++	"testing"
++	"time"
++
++	"github.com/google/syzkaller/pkg/fuzzer"
++	"github.com/stretchr/testify/assert"
++)
++
++func TestEvaluateAdaptiveRestart(t *testing.T) {
++	now := time.Now()
++	policy := RestartPolicy{
++		minLease:          10 * time.Minute,
++		maxLease:          time.Hour,
++		hardMax:           6 * time.Hour,
++		stall:             20 * time.Minute,
++		maxSoftResets:     5,
++		throughputDropPct: 50,
++		unhealthy:         3,
++	}
++	base := restartObservation{
++		now:              now,
++		vmStarted:        now.Add(-time.Hour),
++		leaseStarted:     now.Add(-30 * time.Minute),
++		lastProgress:     now.Add(-5 * time.Minute),
++		peerLastProgress: now.Add(-5 * time.Minute),
++		leaseLimit:       time.Hour,
++		random:           1,
++	}
++	tests := []struct {
++		name   string
++		mutate func(*restartObservation)
++		action RestartAct
++		reason RestartReason
++	}{
++		{
++			name: "continue",
++		},
++		{
++			name: "vm lifetime",
++			mutate: func(obs *restartObservation) {
++				obs.vmStarted = now.Add(-policy.hardMax)
++			},
++			action: RestartHard,
++			reason: RestartReasonVMLifetime,
++		},
++		{
++			name: "unhealthy before minimum lease",
++			mutate: func(obs *restartObservation) {
++				obs.leaseStarted = now.Add(-time.Minute)
++				obs.window.execs = 100
++				obs.window.hangs = policy.unhealthy
++			},
++		},
++		{
++			name: "unhealthy after minimum lease",
++			mutate: func(obs *restartObservation) {
++				obs.window.execs = 100
++				obs.window.hangs = policy.unhealthy
++			},
++			action: RestartSoft,
++			reason: RestartReasonUnhealthy,
++		},
++		{
++			name: "executor restarts are not unhealthy",
++			mutate: func(obs *restartObservation) {
++				obs.window.execs = 100
++				obs.window.restarts = 100
++			},
++		},
++		{
++			name: "throughput degraded",
++			mutate: func(obs *restartObservation) {
++				obs.lowThroughputWindows = 3
++			},
++			action: RestartSoft,
++			reason: RestartReasonThroughput,
++		},
++		{
++			name: "lease limit",
++			mutate: func(obs *restartObservation) {
++				obs.leaseStarted = now.Add(-2 * time.Hour)
++			},
++			action: RestartSoft,
++			reason: RestartReasonLeaseLimit,
++		},
++		{
++			name: "peer progress increases stall reset probability",
++			mutate: func(obs *restartObservation) {
++				obs.lastProgress = now.Add(-policy.stall)
++				obs.peerLastProgress = now
++				obs.random = 0.2
++			},
++			action: RestartSoft,
++			reason: RestartReasonStalled,
++		},
++		{
++			name: "force reset after three stall periods",
++			mutate: func(obs *restartObservation) {
++				obs.lastProgress = now.Add(-3 * policy.stall)
++			},
++			action: RestartSoft,
++			reason: RestartReasonStalled,
++		},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			obs := base
++			if test.mutate != nil {
++				test.mutate(&obs)
++			}
++			decision := evaluateAdaptiveRestart(obs, policy)
++			assert.Equal(t, test.action, decision.Action)
++			assert.Equal(t, test.reason, decision.Reason)
++		})
++	}
++}
++
++func TestAdaptiveRestartAfterLease(t *testing.T) {
++	controller := &Controller{
++		policy: RestartPolicy{
++			hardMax:              time.Hour,
++			maxSoftResets:        3,
++			maxConcurrentActions: 1,
++		},
++		feedback: make([]Feedback, 1),
++		states:   []*VMState{{}},
++	}
++	vmStarted := time.Now()
++	assert.Equal(t, RestartContinue, controller.AfterLease(0, vmStarted, 2).Action)
++	decision := controller.AfterLease(0, vmStarted, 3)
++	assert.Equal(t, RestartHard, decision.Action)
++	assert.Equal(t, RestartReasonTooManyRestores, decision.Reason)
++	assert.True(t, controller.states[0].actionInFlight)
++	assert.NotNil(t, controller.states[0].pending)
++	assert.Equal(t, RestartHard, controller.states[0].pending.action)
++	assert.False(t, controller.states[0].pending.learn)
++	assert.Equal(t, 1, controller.inFlight)
++}
++
++func TestAdaptiveRestartBoundaryConcurrencyLimit(t *testing.T) {
++	controller := &Controller{
++		policy: RestartPolicy{
++			hardMax:              time.Hour,
++			maxSoftResets:        3,
++			maxConcurrentActions: 1,
++		},
++		states:   []*VMState{{}, {}},
++		inFlight: 1,
++	}
++	decision := controller.AfterLease(1, time.Now(), 3)
++	assert.Equal(t, RestartContinue, decision.Action)
++	assert.Equal(t, RestartReasonActionLimit, decision.Reason)
++	assert.False(t, controller.states[1].actionInFlight)
++	assert.Equal(t, 1, controller.inFlight)
++}
++
++func TestBeforeLeaseLetsRestoredStateReachObservationWindow(t *testing.T) {
++	controller := &Controller{
++		policy: RestartPolicy{
++			hardMax:              time.Hour,
++			maxSoftResets:        3,
++			maxConcurrentActions: 1,
++		},
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			pending: &learningSample{
++				action:    RestartSoft,
++				attempted: true,
++			},
++		}},
++	}
++	decision := controller.BeforeLease(0, time.Now(), 3)
++	assert.Equal(t, RestartContinue, decision.Action)
++	assert.Equal(t, RestartSoft, controller.states[0].pending.action)
++}
++
++func TestBoundaryHardResetReplacesPreviousActionSample(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy: RestartPolicy{
++			decisionMode:         "bandit",
++			hardMax:              time.Hour,
++			maxSoftResets:        3,
++			maxConcurrentActions: 1,
++		},
++		feedback: make([]Feedback, 1),
++		learner:  newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			pending: &learningSample{
++				action:    RestartSoft,
++				started:   now.Add(-time.Minute),
++				attempted: true,
++				learn:     true,
++			},
++		}},
++	}
++	controller.feedback[0].execs.Store(100)
++	decision := controller.AfterLease(0, now, 3)
++	assert.Equal(t, RestartHard, decision.Action)
++	assert.Equal(t, uint64(1), controller.learner.models[RestartSoft].count)
++	assert.NotNil(t, controller.states[0].pending)
++	assert.Equal(t, RestartHard, controller.states[0].pending.action)
++	assert.False(t, controller.states[0].pending.attempted)
++
++	controller.ForcedHardReset(0)
++	controller.RegisterCleanSnapshot(0, time.Second)
++	assert.True(t, controller.states[0].pending.attempted)
++	assert.Equal(t, time.Second, controller.states[0].pending.cost)
++}
++
++func TestAdaptiveRestartMonitor(t *testing.T) {
++	controller := &Controller{
++		policy: RestartPolicy{
++			decisionMode:      "heuristic",
++			minLease:          time.Millisecond,
++			maxLease:          5 * time.Millisecond,
++			hardMax:           time.Hour,
++			stall:             time.Hour,
++			evaluation:        time.Millisecond,
++			maxSoftResets:     5,
++			throughputDropPct: 50,
++			unhealthy:         3,
++		},
++		feedback: make([]Feedback, 1),
++		states:   []*VMState{{}},
++		random: []random{{
++			rnd: rand.New(rand.NewSource(1)),
++		}},
++	}
++	ctx, cancel, decisions := controller.StartLease(context.Background(), 0, time.Now(), 0)
++	defer cancel()
++	select {
++	case decision := <-decisions:
++		assert.Equal(t, RestartSoft, decision.Action)
++		assert.Equal(t, RestartReasonLeaseLimit, decision.Reason)
++	case <-time.After(time.Second):
++		t.Fatal("adaptive restart monitor did not make a decision")
++	}
++	<-ctx.Done()
++}
++
++func TestAdaptiveRestartFeedbackAttribution(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 2),
++		states: []*VMState{
++			{},
++			{},
++		},
++	}
++	controller.Record(fuzzer.VMFeedback{
++		VM:           1,
++		Executions:   10,
++		StableSignal: 4,
++		NewInputs:    1,
++	})
++	assert.NotZero(t, controller.feedback[1].lastProgress.Load(),
++		"stable signal and new corpus inputs are useful progress")
++
++	controller.Record(fuzzer.VMFeedback{
++		VM:          1,
++		NewSignal:   2,
++		Hangs:       1,
++		StateDigest: 1234,
++		StateEvents: 5,
++	})
++	snapshot := controller.snapshot(1)
++	assert.Equal(t, uint64(10), snapshot.execs)
++	assert.Equal(t, uint64(2), snapshot.newSignal)
++	assert.Equal(t, uint64(4), snapshot.stableSignal)
++	assert.Equal(t, uint64(1), snapshot.newInputs)
++	assert.Equal(t, uint64(1), snapshot.hangs)
++	assert.NotZero(t, snapshot.stateNovelty)
++	assert.Equal(t, uint64(5), snapshot.stateEvents)
++	assert.NotZero(t, controller.feedback[1].lastProgress.Load())
++}
++
++func TestUniqueCrashRefreshesProgress(t *testing.T) {
++	controller := &Controller{
++		feedback:    make([]Feedback, 1),
++		seenCrashes: make(map[string]struct{}),
++	}
++	controller.RecordCrash(0, "new crash", true)
++	assert.NotZero(t, controller.feedback[0].lastProgress.Load())
++}
++
++func TestStateFingerprintRestore(t *testing.T) {
++	var sketch stateSketch
++	sketch.record(1, 1)
++	first := sketch.snapshot()
++	sketch.record(2, 1)
++	novelty := sketch.novelty.Load()
++	assert.Greater(t, sketch.snapshot().distance(first), uint64(0))
++	sketch.restore(first)
++	assert.Zero(t, sketch.snapshot().distance(first))
++	sketch.restore(stateFingerprint{})
++	sketch.record(1, 1)
++	assert.Equal(t, novelty, sketch.novelty.Load(),
++		"restoring an old state must not make replayed behavior novel again")
++}
++
++func TestStateFingerprintDoesNotSaturateToOneValue(t *testing.T) {
++	var left, right stateSketch
++	for digest := uint64(1); digest <= 10_000; digest++ {
++		left.record(digest, 1)
++		right.record(digest+10_000, 1)
++	}
++	assert.Equal(t, uint64(stateFingerprintWords), left.snapshot().count())
++	assert.Positive(t, left.snapshot().depth())
++	assert.Greater(t, left.snapshot().distance(right.snapshot()), uint64(0),
++		"long-running behavioral signatures must remain distinguishable")
++}
++
++func TestStateFingerprintRemainsResponsiveInLongCampaign(t *testing.T) {
++	var sketch stateSketch
++	for digest := uint64(1); digest <= 10_000; digest++ {
++		sketch.record(digest, 1)
++	}
++	first := sketch.snapshot()
++	for digest := uint64(10_001); digest <= 20_000; digest++ {
++		sketch.record(digest, 1)
++	}
++	assert.Greater(t, sketch.snapshot().distance(first), uint64(0),
++		"recent-behavior registers must keep snapshot fingerprints distinguishable")
++}
++
++func TestStateNoveltyRemainsResponsiveInLongCampaign(t *testing.T) {
++	var sketch stateSketch
++	for digest := uint64(1); digest <= 10_000; digest++ {
++		sketch.record(digest, 0)
++	}
++	first := sketch.novelty.Load()
++	for digest := uint64(10_001); digest <= 20_000; digest++ {
++		sketch.record(digest, 0)
++	}
++	assert.Equal(t, uint64(10_000), sketch.novelty.Load()-first)
++	assert.Equal(t, uint64(20_000), sketch.events.Load(),
++		"each behavioral digest is one state event")
++}
++
++func TestStateNoveltyScoreNormalizesThroughput(t *testing.T) {
++	lowThroughput := feedbackSnapshot{stateNovelty: 10, stateEvents: 100}
++	highThroughput := feedbackSnapshot{stateNovelty: 100, stateEvents: 1000}
++	assert.Equal(t, stateNoveltyScore(lowThroughput), stateNoveltyScore(highThroughput))
++}
++
++func TestLinearUCBLearnsActionReward(t *testing.T) {
++	learner := newLinearUCB(0.1, 1)
++	features := features{1}
++	for range 20 {
++		learner.update(RestartContinue, features, 10)
++		learner.update(RestartSoft, features, -10)
++	}
++	action := learner.selectAction(features, []RestartAct{RestartContinue, RestartSoft}, 0)
++	assert.Equal(t, RestartContinue, action)
++}
++
++func TestLinearUCBExploresUntriedActions(t *testing.T) {
++	learner := newLinearUCB(0.1, 1)
++	features := features{1}
++	actions := []RestartAct{RestartContinue, RestartSoft}
++	assert.Equal(t, RestartSoft, learner.selectAction(features, actions, 0.75))
++	learner.update(RestartSoft, features, 100)
++	assert.Equal(t, RestartContinue, learner.selectAction(features, actions, 0.75))
++}
++
++func TestLinearUCBDiscountsUnselectedActions(t *testing.T) {
++	learner := newLinearUCB(0.5, 0.5)
++	features := features{1}
++	learner.update(RestartSoft, features, 10)
++	assert.Equal(t, 2.0, learner.models[RestartSoft].matrix[0][0])
++	learner.update(RestartContinue, features, 1)
++	assert.Equal(t, 1.5, learner.models[RestartSoft].matrix[0][0])
++	assert.Equal(t, 5.0, learner.models[RestartSoft].reward[0],
++		"the unselected action reward must decay toward its prior")
++}
++
++func TestAdaptiveFeaturesIncludeStateAge(t *testing.T) {
++	now := time.Now()
++	features := adaptiveFeaturesFor(restartObservation{
++		now:          now,
++		vmStarted:    now.Add(-time.Hour),
++		leaseStarted: now.Add(-time.Minute),
++		lastProgress: now,
++		leaseLimit:   time.Hour,
++		stateAge:     30 * time.Minute,
++	})
++	assert.InDelta(t, 0.5, features[15], 0.001)
++}
++
++func TestAdaptiveRewardUsesWallClockRateAndFailurePenalty(t *testing.T) {
++	delta := feedbackSnapshot{newInputs: 10, execs: 1000}
++	short := Reward(delta, time.Minute, 0, false)
++	long := Reward(delta, 10*time.Minute, 0, false)
++	failed := Reward(delta, time.Minute, 0, true)
++	assert.Greater(t, short, long)
++	assert.Less(t, failed, short)
++}
++
++func TestSnapshotBankRandomSelection(t *testing.T) {
++	now := time.Now()
++	var bank snapshotBank
++	assert.Empty(t, bank.evictionCandidate(0))
++	bank.reset(CleanSnapshotName, now)
++	// When bank has no entries, selectRandom falls back to clean.
++	assert.Equal(t, CleanSnapshotName, bank.selectRandom(nil, 0.5).name)
++	bank.append(Snapshot{name: "snap1", value: 10, created: now})
++	bank.append(Snapshot{name: "snap2", value: 1, created: now})
++	// Candidates in snapshot bank: snap1 (0) and snap2 (1)
++	assert.Equal(t, "snap1", bank.selectRandom(nil, 0.2).name)
++	assert.Equal(t, "snap2", bank.selectRandom(nil, 0.8).name)
++	assert.Equal(t, "snap2", bank.evictionCandidate(2))
++}
++
++func TestSnapshotBankEvictsLowestRetentionScore(t *testing.T) {
++	var bank snapshotBank
++	bank.append(Snapshot{name: "low", value: 1})
++	bank.append(Snapshot{name: "valuable", value: 10})
++	bank.append(Snapshot{name: "novel", novelty: 100})
++	assert.Equal(t, "low", bank.evictionCandidate(3))
++}
++
++func TestSnapshotBankRandomExclusion(t *testing.T) {
++	now := time.Now()
++	var bank snapshotBank
++	bank.reset(CleanSnapshotName, now)
++	bank.append(Snapshot{name: "snap1", value: 10})
++	bank.append(Snapshot{name: "snap2", value: 1})
++	// With snap1 excluded, only snap2 remains in the bank
++	assert.Equal(t, "snap2", bank.selectRandom([]string{"snap1"}, 0.2).name)
++	// With both snap1 and snap2 excluded, falls back to clean
++	assert.Equal(t, CleanSnapshotName, bank.selectRandom([]string{"snap1", "snap2"}, 0.5).name)
++}
++
++func TestSnapshotScoreDoesNotAgeWhileSnapshotIsDormant(t *testing.T) {
++	recent := Snapshot{
++		name:     "recent",
++		created:  time.Now(),
++		stateAge: 2 * time.Hour,
++	}
++	dormant := Snapshot{
++		name:     "dormant",
++		created:  time.Now().Add(-24 * time.Hour),
++		stateAge: time.Hour,
++	}
++	assert.Greater(t,
++		snapshotScore(recent, stateFingerprint{}),
++		snapshotScore(dormant, stateFingerprint{}))
++}
++
++func TestUniqueCrashReward(t *testing.T) {
++	controller := &Controller{
++		feedback:    make([]Feedback, 2),
++		seenCrashes: make(map[string]struct{}),
++	}
++	controller.RecordCrash(0, "same crash", true)
++	controller.RecordCrash(1, "same crash", true)
++	assert.Equal(t, uint64(2), controller.snapshot(0).crashes+controller.snapshot(1).crashes)
++	assert.Equal(t, uint64(1), controller.snapshot(0).uniqueCrashes+controller.snapshot(1).uniqueCrashes)
++}
++
++func TestInfrastructureCrashIsNotRewardedAsUnique(t *testing.T) {
++	controller := &Controller{
++		feedback:    make([]Feedback, 1),
++		seenCrashes: make(map[string]struct{}),
++	}
++	controller.RecordCrash(0, "lost connection to test machine", false)
++	snapshot := controller.snapshot(0)
++	assert.Equal(t, uint64(1), snapshot.crashes)
++	assert.Zero(t, snapshot.uniqueCrashes)
++	assert.Zero(t, controller.feedback[0].lastProgress.Load())
++}
++
++func TestCrashRecoveryUsesCleanSnapshot(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			bank: snapshotBank{
++				clean: Snapshot{name: CleanSnapshotName},
++				entries: []Snapshot{{
++					name:  "productive",
++					value: 100,
++				}},
++			},
++		}},
++	}
++	normalRecovery := controller.RecoveryDecision(0, false)
++	assert.Equal(t, "productive", normalRecovery.SnapshotName)
++	assert.Equal(t, RestartReasonRunEnded, normalRecovery.Reason)
++	controller.CompleteAction(0, RestartDecision{Action: RestartSoft}, 0, false)
++	crashRecovery := controller.RecoveryDecision(0, true)
++	assert.Equal(t, CleanSnapshotName, crashRecovery.SnapshotName)
++	assert.Equal(t, RestartReasonCrashRecovery, crashRecovery.Reason)
++}
++
++func TestLineageCrashRecoveryExcludesAncestors(t *testing.T) {
++	controller := &Controller{
++		policy:   RestartPolicy{lineageCrashRecovery: true},
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			lineage: []string{"root", "parent"},
++			bank: snapshotBank{
++				clean: Snapshot{name: CleanSnapshotName},
++				entries: []Snapshot{
++					{name: "root", value: 100},
++					{name: "parent", value: 200, ancestors: []string{"root"}},
++					{name: "unrelated", value: 10},
++				},
++			},
++		}},
++	}
++	decision := controller.RecoveryDecision(0, true)
++	assert.Equal(t, "unrelated", decision.SnapshotName)
++	assert.Equal(t, RestartReasonCrashRecovery, decision.Reason)
++	assert.Equal(t, "unrelated", controller.states[0].pending.snapshot)
++
++	// A run that ended without a crash may still return to any snapshot in the bank.
++	controller.CompleteAction(0, RestartDecision{Action: RestartSoft}, 0, false)
++	decision = controller.RecoveryDecision(0, false)
++	assert.Contains(t, []string{"root", "parent", "unrelated"}, decision.SnapshotName)
++}
++
++func TestLineageCrashRecoveryFallsBackToClean(t *testing.T) {
++	controller := &Controller{
++		policy:   RestartPolicy{lineageCrashRecovery: true},
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			lineage: []string{"parent"},
++			bank: snapshotBank{
++				clean:   Snapshot{name: CleanSnapshotName},
++				entries: []Snapshot{{name: "parent", value: 100}},
++			},
++		}},
++	}
++	decision := controller.RecoveryDecision(0, true)
++	assert.Equal(t, CleanSnapshotName, decision.SnapshotName)
++}
++
++func TestLineageFollowsCheckpointsAndRestores(t *testing.T) {
++	controller := &Controller{
++		policy:   RestartPolicy{lineageCrashRecovery: true},
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			bank: snapshotBank{clean: Snapshot{name: CleanSnapshotName}},
++		}},
++	}
++	state := controller.states[0]
++	checkpoint := func(name string) {
++		controller.CompleteAction(0, RestartDecision{Action: RestartCheckpoint, SnapshotName: name}, 0, true)
++	}
++	restore := func(name string) {
++		controller.CompleteAction(0, RestartDecision{Action: RestartSoft, SnapshotName: name}, 0, true)
++	}
++
++	// The live state keeps running after a checkpoint, so it descends from it.
++	checkpoint("a")
++	assert.Equal(t, []string{"a"}, state.lineage)
++	assert.Empty(t, state.bank.find("a").ancestors)
++	checkpoint("b")
++	assert.Equal(t, []string{"a", "b"}, state.lineage)
++	assert.Equal(t, []string{"a"}, state.bank.find("b").ancestors)
++
++	// Restoring an older snapshot drops the later one from the lineage.
++	restore("a")
++	assert.Equal(t, []string{"a"}, state.lineage)
++	checkpoint("c")
++	assert.Equal(t, []string{"a", "c"}, state.lineage)
++	assert.Equal(t, []string{"a"}, state.bank.find("b").ancestors)
++
++	// "b" shares only the prefix "a" with the crashed state and stays eligible.
++	state.bank.find("b").value = 1
++	assert.Equal(t, "b", controller.RecoveryDecision(0, true).SnapshotName)
++	restore("b")
++	assert.Equal(t, []string{"a", "b"}, state.lineage)
++
++	restore(CleanSnapshotName)
++	assert.Empty(t, state.lineage)
++
++	// A checkpoint failure leaves the lineage untouched.
++	controller.CompleteAction(0, RestartDecision{Action: RestartCheckpoint, SnapshotName: "d"}, 0, false)
++	assert.Empty(t, state.lineage)
++
++	checkpoint("e")
++	controller.RegisterCleanSnapshot(0, 0)
++	assert.Empty(t, state.lineage)
++	assert.Empty(t, state.bank.entries)
++}
++
++func TestCrashRecoveryReplacesCensoredCheckpoint(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			actionInFlight: true,
++			bank: snapshotBank{
++				clean: Snapshot{name: CleanSnapshotName},
++			},
++			pending: &learningSample{
++				action:   RestartCheckpoint,
++				snapshot: "crashed-state",
++			},
++		}},
++		inFlight: 1,
++	}
++	decision := controller.RecoveryDecision(0, true)
++	assert.Equal(t, RestartSoft, decision.Action)
++	assert.Equal(t, CleanSnapshotName, decision.SnapshotName)
++	assert.Equal(t, RestartReasonCrashRecovery, decision.Reason)
++	assert.Equal(t, 1, controller.inFlight)
++	assert.True(t, controller.states[0].actionInFlight)
++	assert.Equal(t, CleanSnapshotName, controller.states[0].pending.snapshot)
++}
++
++func TestRecoveryDecisionSeparatesOnlineAndSnapshotRewards(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy:      RestartPolicy{decisionMode: "bandit"},
++		feedback:    make([]Feedback, 1),
++		learner:     newLinearUCB(0.1, 1),
++		seenCrashes: make(map[string]struct{}),
++		states: []*VMState{{
++			bank: snapshotBank{
++				clean: Snapshot{name: CleanSnapshotName},
++				entries: []Snapshot{{
++					name:  "productive",
++					value: 10,
++				}},
++			},
++			pending: &learningSample{
++				action:    RestartContinue,
++				started:   now.Add(-time.Minute),
++				learn:     true,
++				attempted: true,
++			},
++		}},
++	}
++	controller.feedback[0].execs.Store(100)
++	decision := controller.RecoveryDecision(0, false)
++	assert.Equal(t, uint64(1), controller.learner.models[RestartContinue].count)
++	assert.Equal(t, "productive", controller.states[0].pending.snapshot)
++	assert.False(t, controller.states[0].pending.learn)
++
++	controller.CompleteAction(0, decision, time.Second, true)
++	controller.feedback[0].execs.Store(200)
++	controller.feedback[0].newInputs.Store(1)
++	controller.mu.Lock()
++	controller.finishLearningSampleLocked(controller.states[0], controller.snapshot(0), time.Now().Add(time.Minute))
++	controller.mu.Unlock()
++	assert.Equal(t, uint64(1), controller.states[0].bank.find("productive").rewardSamples)
++	assert.Zero(t, controller.learner.models[RestartSoft].count)
++}
++
++func TestRestoreSnapshotMetadata(t *testing.T) {
++	savedAge := time.Hour
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			value:        100,
++			lastNovelty:  50,
++			stateStarted: time.Now(),
++			bank: snapshotBank{
++				entries: []Snapshot{{
++					name:     "saved",
++					value:    7,
++					novelty:  11,
++					stateAge: savedAge,
++				}},
++			},
++		}},
++	}
++	decision := RestartDecision{Action: RestartSoft, SnapshotName: "saved"}
++	controller.CompleteAction(0, decision, 0, true)
++	assert.Equal(t, 7.0, controller.states[0].value)
++	assert.Equal(t, uint64(11), controller.states[0].lastNovelty)
++	assert.WithinDuration(t, time.Now().Add(-savedAge), controller.states[0].stateStarted, time.Second)
++}
++
++func TestRestoreCleanSnapshotResetsStateAge(t *testing.T) {
++	old := time.Now().Add(-24 * time.Hour)
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			stateStarted: old,
++			bank: snapshotBank{
++				clean: Snapshot{name: CleanSnapshotName, created: old},
++			},
++		}},
++	}
++	controller.CompleteAction(0, RestartDecision{Action: RestartSoft, SnapshotName: CleanSnapshotName}, 0, true)
++	assert.WithinDuration(t, time.Now(), controller.states[0].stateStarted, time.Second)
++}
++
++func TestForcedHardResetClearsPendingLearning(t *testing.T) {
++	controller := &Controller{
++		states: []*VMState{{pending: &learningSample{action: RestartContinue}}},
++	}
++	controller.ForcedHardReset(0)
++	assert.Nil(t, controller.states[0].pending)
++	assert.True(t, controller.states[0].actionInFlight)
++	assert.Equal(t, 1, controller.inFlight)
++}
++
++func TestForcedHardResetFinishesAttemptedLearning(t *testing.T) {
++	controller := &Controller{
++		policy:   RestartPolicy{decisionMode: "bandit"},
++		feedback: make([]Feedback, 1),
++		learner:  newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			pending: &learningSample{
++				action:    RestartContinue,
++				started:   time.Now().Add(-time.Minute),
++				learn:     true,
++				attempted: true,
++			},
++		}},
++	}
++	controller.feedback[0].execs.Store(100)
++	controller.ForcedHardReset(0)
++	assert.Nil(t, controller.states[0].pending)
++	assert.Equal(t, uint64(1), controller.learner.models[RestartContinue].count)
++	assert.True(t, controller.states[0].actionInFlight)
++}
++
++func TestForcedHardResetPreservesSelectedOnlineAction(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy:   RestartPolicy{decisionMode: "bandit"},
++		feedback: make([]Feedback, 1),
++		learner:  newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			actionInFlight: true,
++			pending: &learningSample{
++				action:  RestartHard,
++				started: now.Add(-time.Minute),
++				learn:   true,
++			},
++		}},
++		inFlight: 1,
++	}
++	controller.ForcedHardReset(0)
++	assert.NotNil(t, controller.states[0].pending)
++	assert.True(t, controller.states[0].pending.attempted)
++
++	controller.RegisterCleanSnapshot(0, time.Second)
++	controller.feedback[0].execs.Store(100)
++	controller.mu.Lock()
++	controller.finishLearningSampleLocked(controller.states[0], controller.snapshot(0), now)
++	controller.mu.Unlock()
++	assert.Equal(t, uint64(1), controller.learner.models[RestartHard].count)
++}
++
++func TestRegisterCleanSnapshotDropsCensoredAction(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			actionInFlight: true,
++			pending: &learningSample{
++				action:   RestartSoft,
++				snapshot: CleanSnapshotName,
++			},
++		}},
++		inFlight: 1,
++	}
++	controller.RegisterCleanSnapshot(0, time.Second)
++	assert.Nil(t, controller.states[0].pending)
++	assert.False(t, controller.states[0].actionInFlight)
++	assert.Zero(t, controller.inFlight)
++}
++
++func TestRegisterCleanSnapshotClearsAttemptedActionBankAttribution(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			pending: &learningSample{
++				action:    RestartSoft,
++				attempted: true,
++				snapshot:  CleanSnapshotName,
++			},
++		}},
++	}
++	controller.RegisterCleanSnapshot(0, time.Second)
++	assert.NotNil(t, controller.states[0].pending)
++	assert.Empty(t, controller.states[0].pending.snapshot)
++	assert.True(t, controller.states[0].pending.failed)
++}
++
++func TestRegisterCleanSnapshotCompletesOnlineHardReset(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			pending: &learningSample{action: RestartHard},
++		}},
++	}
++	controller.RegisterCleanSnapshot(0, time.Second)
++	assert.True(t, controller.states[0].pending.attempted)
++	assert.False(t, controller.states[0].pending.failed)
++}
++
++func TestRegisterCleanSnapshotMarksUnexpectedContinueFailure(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			pending: &learningSample{
++				action:    RestartContinue,
++				attempted: true,
++			},
++		}},
++	}
++	controller.feedback[0].execs.Store(100)
++	controller.RegisterCleanSnapshot(0, time.Second)
++	assert.True(t, controller.states[0].pending.failed)
++	assert.Equal(t, uint64(100), controller.states[0].pending.baseline.execs)
++}
++
++func TestCompleteActionStartsPostActionObservation(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			pending: &learningSample{action: RestartCheckpoint},
++		}},
++	}
++	controller.feedback[0].execs.Store(100)
++	controller.feedback[0].newInputs.Store(1)
++	controller.CompleteAction(0, RestartDecision{Action: RestartCheckpoint}, time.Second, true)
++	assert.Equal(t, uint64(100), controller.states[0].pending.baseline.execs)
++	assert.Equal(t, uint64(1), controller.states[0].pending.baseline.newInputs,
++		"feedback observed before an action completes must not be credited to it")
++}
++
++func TestCheckpointStoresSaveTimeFingerprint(t *testing.T) {
++	controller := &Controller{
++		feedback: make([]Feedback, 1),
++		states: []*VMState{{
++			bank: snapshotBank{},
++		}},
++	}
++	controller.feedback[0].state.record(123, 1)
++	actual := controller.feedback[0].state.snapshot()
++	decision := RestartDecision{
++		Action:       RestartCheckpoint,
++		SnapshotName: "state",
++		fingerprint:  stateFingerprint{999},
++	}
++	controller.CompleteAction(0, decision, time.Second, true)
++	assert.Equal(t, actual, controller.states[0].bank.find("state").fingerprint)
++}
++
++func TestSafetyActionDoesNotTrainOnlineModel(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy:  RestartPolicy{decisionMode: "bandit"},
++		learner: newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			pending: &learningSample{
++				action:    RestartSoft,
++				baseline:  feedbackSnapshot{},
++				started:   now.Add(-time.Minute),
++				learn:     false,
++				attempted: true,
++			},
++		}},
++	}
++	controller.finishLearningSampleLocked(controller.states[0],
++		feedbackSnapshot{execs: 100}, now)
++	assert.Zero(t, controller.learner.models[RestartSoft].count)
++}
++
++func TestSnapshotRestoreRewardUpdatesBank(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy:  RestartPolicy{decisionMode: "bandit"},
++		learner: newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			bank: snapshotBank{
++				entries: []Snapshot{{name: "state"}},
++			},
++			pending: &learningSample{
++				action:    RestartSoft,
++				baseline:  feedbackSnapshot{},
++				started:   now.Add(-time.Minute),
++				snapshot:  "state",
++				learn:     true,
++				attempted: true,
++			},
++		}},
++	}
++	controller.finishLearningSampleLocked(controller.states[0],
++		feedbackSnapshot{execs: 100, newInputs: 2}, now)
++	snapshot := controller.states[0].bank.find("state")
++	assert.Equal(t, uint64(1), snapshot.rewardSamples)
++	assert.NotZero(t, snapshot.reward)
++	assert.Equal(t, uint64(1), controller.learner.models[RestartSoft].count)
++}
++
++func TestSnapshotReuseCreditsCheckpointCreation(t *testing.T) {
++	now := time.Now()
++	features := features{1, 2}
++	controller := &Controller{
++		policy:  RestartPolicy{decisionMode: "bandit"},
++		learner: newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			bank: snapshotBank{
++				entries: []Snapshot{{
++					name:              "state",
++					promotionFeatures: features,
++					promotionLearn:    true,
++				}},
++			},
++			pending: &learningSample{
++				action:    RestartSoft,
++				started:   now.Add(-time.Minute),
++				snapshot:  "state",
++				attempted: true,
++			},
++		}},
++	}
++	controller.finishLearningSampleLocked(controller.states[0],
++		feedbackSnapshot{execs: 100, newInputs: 2}, now)
++	assert.Equal(t, uint64(1), controller.learner.models[RestartCheckpoint].count)
++}
++
++func TestOnlinePolicyDoesNotPromoteDuplicateState(t *testing.T) {
++	fingerprint := stateFingerprint{1}
++	controller := &Controller{
++		policy: RestartPolicy{
++			snapshotBankSize:        2,
++			statePromotionThreshold: 1,
++		},
++		learner: newLinearUCB(0.1, 1),
++		states: []*VMState{{
++			bank: snapshotBank{
++				entries: []Snapshot{{name: "same", fingerprint: fingerprint}},
++			},
++		}},
++	}
++	obs := restartObservation{
++		fingerprint: fingerprint,
++		window:      feedbackSnapshot{stateNovelty: 100},
++	}
++	assert.False(t, controller.canPromoteLocked(0, obs))
++
++	controller.states[0].bank.entries = nil
++	assert.True(t, controller.canPromoteLocked(0, obs))
++}
++
++func TestPromotionRemainsReachableAfterNoveltyCacheStabilizes(t *testing.T) {
++	controller := &Controller{
++		policy: RestartPolicy{
++			snapshotBankSize:        2,
++			statePromotionThreshold: 8,
++		},
++		states: []*VMState{{}},
++	}
++	obs := restartObservation{
++		fingerprint: stateFingerprint{1},
++		window: feedbackSnapshot{
++			newInputs:    1,
++			stateNovelty: 1,
++			stateEvents:  1000,
++		},
++	}
++	assert.True(t, controller.canPromoteLocked(0, obs),
++		"a useful first intermediate state must not be starved by a mature novelty cache")
++
++	controller.states[0].bank.entries = []Snapshot{{
++		name:        "near",
++		fingerprint: obs.fingerprint,
++	}}
++	obs.fingerprint[0] = 2
++	assert.False(t, controller.canPromoteLocked(0, obs),
++		"a nearly identical state must not churn the snapshot bank")
++
++	for index := range statePromotionMinDistance {
++		obs.fingerprint[index] = uint64(index + 10)
++	}
++	assert.True(t, controller.canPromoteLocked(0, obs),
++		"useful behaviorally distinct states must remain promotable")
++}
++
++func TestHeuristicPromotionRequiresNoveltyThreshold(t *testing.T) {
++	controller := &Controller{
++		policy: RestartPolicy{
++			snapshotBankSize:        2,
++			statePromotionThreshold: 8,
++		},
++		states: []*VMState{{}},
++	}
++	obs := restartObservation{
++		fingerprint: stateFingerprint{1},
++		window: feedbackSnapshot{
++			newInputs:    1,
++			stateNovelty: 1,
++			stateEvents:  1000,
++		},
++	}
++	assert.True(t, controller.canPromoteLocked(0, obs),
++		"the online policy must retain its anti-starvation fallback")
++	assert.False(t, controller.canPromoteHeuristicLocked(0, obs),
++		"the heuristic ablation must remain a strict threshold baseline")
++
++	obs.window.stateNovelty = controller.policy.statePromotionThreshold
++	assert.True(t, controller.canPromoteHeuristicLocked(0, obs))
++}
++
++func TestHeuristicPolicyPromotesThresholdState(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy: RestartPolicy{
++			decisionMode:            "heuristic",
++			minLease:                time.Minute,
++			maxLease:                time.Hour,
++			hardMax:                 6 * time.Hour,
++			stall:                   time.Hour,
++			maxSoftResets:           8,
++			unhealthy:               3,
++			snapshotBankSize:        2,
++			statePromotionThreshold: 8,
++			maxConcurrentActions:    1,
++		},
++		feedback: make([]Feedback, 1),
++		states:   []*VMState{{stateStarted: now}},
++		random: []random{{
++			rnd: rand.New(rand.NewSource(1)),
++		}},
++	}
++	controller.feedback[0].state.record(1, 1)
++	decision := controller.decide(0, restartObservation{
++		now:          now,
++		vmStarted:    now.Add(-10 * time.Minute),
++		leaseStarted: now.Add(-10 * time.Minute),
++		lastProgress: now,
++		leaseLimit:   time.Hour,
++		window: feedbackSnapshot{
++			execs:        100,
++			stateNovelty: 8,
++			stateEvents:  100,
++		},
++	}, feedbackSnapshot{execs: 100, stateNovelty: 8, stateEvents: 100})
++	assert.Equal(t, RestartCheckpoint, decision.Action)
++	assert.Equal(t, RestartReasonStatePromotion, decision.Reason)
++	assert.False(t, controller.states[0].pending.learn)
++}
++
++func TestOnlineCheckpointIsPromotedIntoSnapshotBank(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy: RestartPolicy{
++			snapshotBankSize:        2,
++			statePromotionThreshold: 1,
++			maxConcurrentActions:    1,
++			maxLease:                24 * time.Hour,
++		},
++		feedback: make([]Feedback, 1),
++		learner:  newLinearUCB(0.1, 1),
++		states:   []*VMState{{stateStarted: now}},
++	}
++	controller.states[0].bank.reset(CleanSnapshotName, now)
++	obs := restartObservation{
++		now:          now,
++		vmStarted:    now,
++		leaseStarted: now,
++		lastProgress: now,
++		leaseLimit:   24 * time.Hour,
++		random:       0.9,
++		stateValue:   10,
++		stateAge:     time.Hour,
++		fingerprint:  stateFingerprint{1},
++		window:       feedbackSnapshot{stateNovelty: 10},
++	}
++	decision := controller.onlineDecisionLocked(0, obs)
++	assert.Equal(t, RestartCheckpoint, decision.Action)
++	controller.prepareActionLocked(0, &decision)
++	controller.startLearningSampleLocked(controller.states[0], decision,
++		adaptiveFeaturesFor(obs), feedbackSnapshot{}, now)
++	controller.CompleteAction(0, decision, time.Second, true)
++	assert.Len(t, controller.states[0].bank.entries, 1)
++	if len(controller.states[0].bank.entries) != 0 {
++		assert.Equal(t, decision.SnapshotName, controller.states[0].bank.entries[0].name)
++	}
++}
++
++func TestBanditDecisionIsReachable(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy: RestartPolicy{
++			decisionMode:            "bandit",
++			minLease:                15 * time.Minute,
++			maxLease:                time.Hour,
++			hardMax:                 6 * time.Hour,
++			maxSoftResets:           8,
++			unhealthy:               3,
++			statePromotionThreshold: 8,
++			maxConcurrentActions:    1,
++		},
++		feedback: make([]Feedback, 1),
++		states:   []*VMState{{stateStarted: now}},
++		learner:  newLinearUCB(0, 1),
++		random: []random{{
++			rnd: rand.New(rand.NewSource(1)),
++		}},
++	}
++	decision := controller.decide(0, restartObservation{
++		now:          now,
++		vmStarted:    now.Add(-time.Hour),
++		leaseStarted: now.Add(-15 * time.Minute),
++		lastProgress: now,
++		leaseLimit:   time.Hour,
++		window: feedbackSnapshot{
++			execs:    1000,
++			hangs:    2,
++			restarts: 20,
++		},
++	}, feedbackSnapshot{execs: 1000})
++	assert.Equal(t, RestartSoft, decision.Action)
++	assert.Equal(t, RestartReasonOnlinePolicy, decision.Reason)
++	assert.NotNil(t, controller.states[0].pending)
++}
++
++func TestMeasuredWindowDoesNotForceEarlyRecovery(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy: RestartPolicy{
++			decisionMode:         "bandit",
++			minLease:             15 * time.Minute,
++			maxLease:             time.Hour,
++			hardMax:              6 * time.Hour,
++			maxSoftResets:        8,
++			unhealthy:            3,
++			maxConcurrentActions: 1,
++		},
++		feedback: make([]Feedback, 1),
++		states:   []*VMState{{stateStarted: now}},
++		learner:  newLinearUCB(0.75, 0.98),
++		random: []random{{
++			rnd: rand.New(rand.NewSource(1)),
++		}},
++	}
++	decision := controller.decide(0, restartObservation{
++		now:          now,
++		vmStarted:    now.Add(-5 * time.Minute),
++		leaseStarted: now.Add(-5 * time.Minute),
++		lastProgress: now,
++		leaseLimit:   time.Hour,
++		window: feedbackSnapshot{
++			execs:    1755,
++			hangs:    6,
++			restarts: 12,
++		},
++	}, feedbackSnapshot{execs: 1755})
++	assert.Equal(t, RestartContinue, decision.Action)
++	assert.Empty(t, decision.Reason)
++	assert.Zero(t, controller.inFlight)
++}
++
++func TestAdaptiveActionConcurrencyLimit(t *testing.T) {
++	now := time.Now()
++	controller := &Controller{
++		policy: RestartPolicy{
++			decisionMode:         "heuristic",
++			minLease:             time.Minute,
++			maxLease:             time.Minute,
++			hardMax:              time.Hour,
++			maxSoftResets:        8,
++			unhealthy:            3,
++			maxConcurrentActions: 1,
++		},
++		feedback: make([]Feedback, 2),
++		states:   []*VMState{{}, {}},
++		random: []random{
++			{rnd: rand.New(rand.NewSource(1))},
++			{rnd: rand.New(rand.NewSource(2))},
++		},
++		inFlight: 1,
++	}
++	decision := controller.decide(1, restartObservation{
++		now:          now,
++		vmStarted:    now.Add(-30 * time.Minute),
++		leaseStarted: now.Add(-2 * time.Minute),
++		lastProgress: now,
++		leaseLimit:   time.Minute,
++		window:       feedbackSnapshot{execs: 1000},
++	}, feedbackSnapshot{execs: 1000})
++	assert.Equal(t, RestartContinue, decision.Action)
++	assert.Equal(t, RestartReasonActionLimit, decision.Reason)
++	assert.False(t, controller.states[1].actionInFlight)
++	assert.Equal(t, 1, controller.inFlight)
++}
++
++func TestUniqueCrashHasHigherReward(t *testing.T) {
++	duplicate := Reward(feedbackSnapshot{crashes: 1}, time.Minute, 0, false)
++	unique := Reward(feedbackSnapshot{crashes: 1, uniqueCrashes: 1}, time.Minute, 0, false)
++	assert.Greater(t, unique, duplicate)
++}
++
++func TestUniqueCrashCounterCannotUnderflowReward(t *testing.T) {
++	reward := Reward(feedbackSnapshot{uniqueCrashes: 1}, time.Minute, 0, false)
++	assert.Equal(t, 25.0, reward)
++}
+diff --git a/pkg/adaptive/state.go b/pkg/adaptive/state.go
+new file mode 100644
+index 000000000..2150db87b
+--- /dev/null
++++ b/pkg/adaptive/state.go
+@@ -0,0 +1,345 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package adaptive
++
++import (
++	"math"
++	"math/rand"
++	"slices"
++	"sync/atomic"
++	"time"
++)
++
++const (
++	stateFingerprintDepthWords  = 64
++	stateFingerprintRecentWords = 64
++	stateFingerprintWords       = stateFingerprintDepthWords + stateFingerprintRecentWords
++	stateNoveltySlots           = 4096
++	statePromotionMinDistance   = stateFingerprintRecentWords / 4
++)
++
++type stateFingerprint [stateFingerprintWords]uint64
++
++// count returns the number of initialized registers in the fingerprint.
++func (f stateFingerprint) count() uint64 {
++	var total uint64
++	for _, word := range f {
++		if word != 0 {
++			total++
++		}
++	}
++	return total
++}
++
++// distance returns the number of registers that differ between two fingerprints.
++func (f stateFingerprint) distance(other stateFingerprint) uint64 {
++	var total uint64
++	for index, word := range f {
++		if word != other[index] {
++			total++
++		}
++	}
++	return total
++}
++
++// depth estimates accumulated behavioral depth from the long-term MinHash registers.
++func (f stateFingerprint) depth() float64 {
++	var total float64
++	var samples uint64
++	scale := float64(^uint64(0))
++	for _, word := range f[:stateFingerprintDepthWords] {
++		if word == 0 {
++			continue
++		}
++		// MinHash register minima decrease as more distinct behavior reaches the
++		// state. The negative log yields a stable, non-saturating depth proxy.
++		total -= math.Log(float64(word) / scale)
++		samples++
++	}
++	if samples == 0 {
++		return 0
++	}
++	return total / float64(samples)
++}
++
++// digest returns a compact deterministic hash of the complete fingerprint.
++func (f stateFingerprint) digest() uint64 {
++	const prime = uint64(1099511628211)
++	hash := uint64(14695981039346656037)
++	for _, word := range f {
++		hash ^= word
++		hash *= prime
++	}
++	return hash
++}
++
++type stateSketch struct {
++	// The first half of words is a MinHash-style long-term depth signature. The
++	// second half is a direct-mapped recent-behavior signature that keeps
++	// snapshot distance and duplicate detection responsive after the MinHash
++	// minima stop changing frequently. Both halves are restored with a snapshot.
++	// recent is a larger campaign-local cache used only for novelty counting; it
++	// is never restored, so immediately replaying a snapshot does not manufacture
++	// novelty.
++	words   [stateFingerprintWords]atomic.Uint64
++	recent  [stateNoveltySlots]atomic.Uint64
++	novelty atomic.Uint64
++	events  atomic.Uint64
++}
++
++// record adds observed behavior to the campaign-local novelty cache and the
++// restorable hybrid state fingerprint.
++func (sketch *stateSketch) record(digest, events uint64) {
++	if digest == 0 {
++		return
++	}
++	sketch.events.Add(max(uint64(1), events))
++	slot := mixStateDigest(digest^0x243f6a8885a308d3) % stateNoveltySlots
++	tag := mixStateDigest(digest ^ 0x13198a2e03707344)
++	if tag == 0 {
++		tag = 1
++	}
++	if sketch.recent[slot].Swap(tag) != tag {
++		sketch.novelty.Add(1)
++	}
++	// Four independently mixed register pairs form a compact behavioral-state
++	// signature without adding per-execution locking.
++	for round := range 4 {
++		digest = mixStateDigest(digest + uint64(round)*0x9e3779b97f4a7c15)
++		index := digest % stateFingerprintDepthWords
++		value := mixStateDigest(digest ^ 0xd6e8feb86659fd93)
++		if value == 0 {
++			value = 1
++		}
++		setStateSketchMin(&sketch.words[index], value)
++		recentIndex := stateFingerprintDepthWords +
++			mixStateDigest(digest^0xa4093822299f31d0)%stateFingerprintRecentWords
++		recentValue := mixStateDigest(digest ^ 0x082efa98ec4e6c89)
++		if recentValue == 0 {
++			recentValue = 1
++		}
++		sketch.words[recentIndex].Store(recentValue)
++	}
++}
++
++// setStateSketchMin atomically stores value when it is the first or a smaller
++// MinHash register value, and reports whether the register changed.
++func setStateSketchMin(word *atomic.Uint64, value uint64) bool {
++	for {
++		old := word.Load()
++		if old != 0 && old <= value {
++			return false
++		}
++		if word.CompareAndSwap(old, value) {
++			return true
++		}
++	}
++}
++
++// mixStateDigest deterministically disperses a state digest into a 64-bit value.
++func mixStateDigest(value uint64) uint64 {
++	value ^= value >> 30
++	value *= 0xbf58476d1ce4e5b9
++	value ^= value >> 27
++	value *= 0x94d049bb133111eb
++	return value ^ (value >> 31)
++}
++
++// snapshot returns an atomic view of the restorable fingerprint registers.
++func (sketch *stateSketch) snapshot() stateFingerprint {
++	var fingerprint stateFingerprint
++	for index := range fingerprint {
++		fingerprint[index] = sketch.words[index].Load()
++	}
++	return fingerprint
++}
++
++// restore replaces the restorable fingerprint while preserving campaign-local
++// novelty counters and cache contents.
++func (sketch *stateSketch) restore(fingerprint stateFingerprint) {
++	for index, word := range fingerprint {
++		sketch.words[index].Store(word)
++	}
++}
++
++type Snapshot struct {
++	name          string
++	created       time.Time
++	stateAge      time.Duration
++	fingerprint   stateFingerprint
++	value         float64
++	novelty       uint64
++	uses          uint64
++	reward        float64
++	rewardSamples uint64
++	// Intermediate snapshots whose saved state this snapshot's state extends.
++	ancestors []string
++
++	promotionFeatures features
++	promotionLearn    bool
++}
++
++type snapshotBank struct {
++	clean   Snapshot
++	entries []Snapshot
++	nextID  uint64
++}
++
++// reset replaces the clean snapshot and clears all retained intermediate snapshots.
++func (bank *snapshotBank) reset(cleanName string, now time.Time) {
++	bank.clean = Snapshot{
++		name:    cleanName,
++		created: now,
++	}
++	bank.entries = nil
++	bank.nextID = 0
++}
++
++// find returns the clean or intermediate snapshot with the requested name.
++func (bank *snapshotBank) find(name string) *Snapshot {
++	if bank.clean.name == name {
++		return &bank.clean
++	}
++	for index := range bank.entries {
++		if bank.entries[index].name == name {
++			return &bank.entries[index]
++		}
++	}
++	return nil
++}
++
++// lineage returns the intermediate snapshots a state restored from this
++// snapshot descends from, including the snapshot itself.
++func (s *Snapshot) lineage() []string {
++	if s.name == CleanSnapshotName {
++		return nil
++	}
++	return append(slices.Clone(s.ancestors), s.name)
++}
++
++// selectRandom returns a randomly selected snapshot from the snapshot bank,
++// chosen uniformly among intermediate snapshots not named in excluded,
++// falling back to clean when no intermediate snapshots are eligible.
++func (bank *snapshotBank) selectRandom(excluded []string, rnd float64) *Snapshot {
++	var candidates []*Snapshot
++	for index := range bank.entries {
++		entry := &bank.entries[index]
++		if slices.Contains(excluded, entry.name) {
++			continue
++		}
++		candidates = append(candidates, entry)
++	}
++	if len(candidates) == 0 {
++		return &bank.clean
++	}
++	if len(candidates) == 1 {
++		return candidates[0]
++	}
++	if rnd < 0 || rnd >= 1 {
++		rnd = rand.Float64()
++	}
++	idx := int(rnd * float64(len(candidates)))
++	if idx >= len(candidates) {
++		idx = len(candidates) - 1
++	}
++	return candidates[idx]
++}
++
++// selectFor returns a randomly selected snapshot from the snapshot bank.
++func (bank *snapshotBank) selectFor(current stateFingerprint) *Snapshot {
++	return bank.selectRandom(nil, rand.Float64())
++}
++
++// selectExcluding returns a randomly selected snapshot from the snapshot bank
++// among clean and intermediate snapshots not named in excluded.
++func (bank *snapshotBank) selectExcluding(current stateFingerprint, excluded []string) *Snapshot {
++	return bank.selectRandom(excluded, rand.Float64())
++}
++
++// containsFingerprint reports whether the bank already retains an identical fingerprint.
++func (bank *snapshotBank) containsFingerprint(fingerprint stateFingerprint) bool {
++	if bank.clean.fingerprint == fingerprint {
++		return true
++	}
++	for _, entry := range bank.entries {
++		if entry.fingerprint == fingerprint {
++			return true
++		}
++	}
++	return false
++}
++
++// closestDistance returns the minimum register distance to an intermediate snapshot.
++func (bank *snapshotBank) closestDistance(fingerprint stateFingerprint) uint64 {
++	if len(bank.entries) == 0 {
++		return stateFingerprintWords
++	}
++	distance := uint64(stateFingerprintWords)
++	for _, entry := range bank.entries {
++		distance = min(distance, entry.fingerprint.distance(fingerprint))
++	}
++	return distance
++}
++
++// snapshotScore estimates restoration utility from learned reward, state value,
++// novelty, depth, active age, and distance from the current state.
++func snapshotScore(s Snapshot, current stateFingerprint) float64 {
++	distance := 0.0
++	if s.name != CleanSnapshotName {
++		distance = float64(s.fingerprint.distance(current)) / 4
++	}
++	// Count only active state age accumulated before save; frozen wall time
++	// must not make a retained snapshot appear more valuable.
++	return s.value + s.reward + float64(s.novelty)/10 +
++		s.fingerprint.depth() + s.stateAge.Hours() + distance
++}
++
++// observe updates the snapshot's exponentially weighted reward estimate.
++func (s *Snapshot) observe(reward float64) {
++	const weight = 0.2
++	if s.rewardSamples == 0 {
++		s.reward = reward
++	} else {
++		s.reward = (1-weight)*s.reward + weight*reward
++	}
++	s.rewardSamples++
++}
++
++// snapshotRetentionScore estimates a snapshot's value for bank retention
++// without considering distance from the current state.
++func snapshotRetentionScore(s Snapshot) float64 {
++	return s.value + s.reward + float64(s.novelty)/10 +
++		s.fingerprint.depth() + s.stateAge.Hours()
++}
++
++// evictionCandidate returns the lowest-retention intermediate snapshot when
++// the bank has reached its configured capacity.
++func (bank *snapshotBank) evictionCandidate(maxEntries int) string {
++	if maxEntries <= 0 || len(bank.entries) == 0 || len(bank.entries) < maxEntries {
++		return ""
++	}
++	evict := 0
++	for index := 1; index < len(bank.entries); index++ {
++		left, right := bank.entries[index], bank.entries[evict]
++		if snapshotRetentionScore(left) < snapshotRetentionScore(right) {
++			evict = index
++		}
++	}
++	return bank.entries[evict].name
++}
++
++// remove deletes the named intermediate snapshot from the bank metadata.
++func (bank *snapshotBank) remove(name string) {
++	for index := range bank.entries {
++		if bank.entries[index].name == name {
++			bank.entries = append(bank.entries[:index], bank.entries[index+1:]...)
++			return
++		}
++	}
++}
++
++// append adds an intermediate snapshot to the bank metadata.
++func (bank *snapshotBank) append(s Snapshot) {
++	bank.entries = append(bank.entries, s)
++}
+diff --git a/pkg/corpus/corpus.go b/pkg/corpus/corpus.go
+index 155c96855..f4cbe1042 100644
+--- a/pkg/corpus/corpus.go
++++ b/pkg/corpus/corpus.go
+@@ -137,7 +137,7 @@ type NewItemEvent struct {
+ 	NewCover []uint64
+ }
+ 
+-func (corpus *Corpus) Save(inp NewInput) {
++func (corpus *Corpus) Save(inp NewInput) bool {
+ 	progData := inp.Prog.Serialize()
+ 	sig := hash.String(progData)
+ 
+@@ -199,6 +199,7 @@ func (corpus *Corpus) Save(inp NewInput) {
+ 		}:
+ 		}
+ 	}
++	return !exists
+ }
+ 
+ func (corpus *Corpus) applyFocusAreas(item *Item) {
+diff --git a/pkg/corpus/corpus_test.go b/pkg/corpus/corpus_test.go
+index d001386ca..d21ad3ccb 100644
+--- a/pkg/corpus/corpus_test.go
++++ b/pkg/corpus/corpus_test.go
+@@ -26,8 +26,12 @@ func TestCorpusOperation(t *testing.T) {
+ 	// First program is saved.
+ 	rs := rand.NewSource(0)
+ 	inp1 := generateInput(target, rs, 5)
+-	go corpus.Save(inp1)
++	saved := make(chan bool)
++	go func() {
++		saved <- corpus.Save(inp1)
++	}()
+ 	event := <-ch
++	assert.True(t, <-saved)
+ 	progData := inp1.Prog.Serialize()
+ 	assert.Equal(t, progData, event.ProgData)
+ 	assert.Equal(t, false, event.Exists)
+@@ -37,8 +41,11 @@ func TestCorpusOperation(t *testing.T) {
+ 	progData = inp2.Prog.Serialize()
+ 	for i := range len(inp2.Prog.Calls) {
+ 		inp2.Call = i
+-		go corpus.Save(inp2)
++		go func() {
++		saved <- corpus.Save(inp2)
++		}()
+ 		event := <-ch
++		assert.Equal(t, i == 0, <-saved)
+ 		assert.Equal(t, progData, event.ProgData)
+ 		assert.Equal(t, i != 0, event.Exists)
+ 	}
+diff --git a/pkg/execbackend/rpc.go b/pkg/execbackend/rpc.go
+index 62d586faa..b2589c8f3 100644
+--- a/pkg/execbackend/rpc.go
++++ b/pkg/execbackend/rpc.go
+@@ -35,6 +35,10 @@ func New(cfg *rpcserver.RemoteConfig) (Server, error) {
+ 	}, nil
+ }
+ 
++func (b *rpcBackend) RPCServer() rpcserver.Server {
++	return b.Server
++}
++
+ func (b *rpcBackend) RunRequests(ctx context.Context, inst *vm.Instance,
+ 	reporter *report.Reporter, updInfo dispatcher.UpdateInfo) (
+ 	[]*report.Report, error) {
+diff --git a/pkg/execbackend/server.go b/pkg/execbackend/server.go
+index 7cbacf650..bb1a9cae8 100644
+--- a/pkg/execbackend/server.go
++++ b/pkg/execbackend/server.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/google/syzkaller/pkg/flatrpc"
+ 	"github.com/google/syzkaller/pkg/fuzzer/queue"
+ 	"github.com/google/syzkaller/pkg/report"
++	"github.com/google/syzkaller/pkg/rpcserver"
+ 	"github.com/google/syzkaller/pkg/signal"
+ 	"github.com/google/syzkaller/vm"
+ 	"github.com/google/syzkaller/vm/dispatcher"
+@@ -45,4 +46,7 @@ type Server interface {
+ 	// and returns when the VM crashes, hangs, or the context is canceled.
+ 	RunRequests(ctx context.Context, inst *vm.Instance, reporter *report.Reporter,
+ 		updInfo dispatcher.UpdateInfo) ([]*report.Report, error)
++
++	// RPCServer returns the underlying rpcserver.Server, or nil if not using RPC.
++	RPCServer() rpcserver.Server
+ }
+diff --git a/pkg/execbackend/snapshot.go b/pkg/execbackend/snapshot.go
+index 7047ee709..5cd4ab136 100644
+--- a/pkg/execbackend/snapshot.go
++++ b/pkg/execbackend/snapshot.go
+@@ -54,6 +54,10 @@ func (serv *snapshotServer) SetSource(source queue.Source) {
+ 	serv.Server.Close()
+ }
+ 
++func (serv *snapshotServer) RPCServer() rpcserver.Server {
++	return serv.Server.RPCServer()
++}
++
+ func (serv *snapshotServer) RunRequests(ctx context.Context, inst *vm.Instance,
+ 	reporter *report.Reporter, updInfo dispatcher.UpdateInfo) (
+ 	[]*report.Report, error) {
+diff --git a/pkg/fuzzer/fuzzer.go b/pkg/fuzzer/fuzzer.go
+index efd66fdad..bb75946b1 100644
+--- a/pkg/fuzzer/fuzzer.go
++++ b/pkg/fuzzer/fuzzer.go
+@@ -212,6 +212,7 @@ func (fuzzer *Fuzzer) processResult(req *queue.Request, res *queue.Result, flags
+ }
+ 
+ type Config struct {
++	VMFeedback     func(VMFeedback)
+ 	Debug          bool
+ 	Corpus         *corpus.Corpus
+ 	Logf           func(level int, msg string, args ...any)
+@@ -493,3 +494,88 @@ func DefaultExecOpts(cfg *mgrconfig.Config, features flatrpc.Feature, debug bool
+ 		SandboxArg: cfg.SandboxArg,
+ 	}
+ }
++
++// VMFeedback reports fuzzing outcomes attributed to the VM that discovered them.
++// Consumers must tolerate concurrent calls from fuzzing and triage goroutines.
++type VMFeedback struct {
++	VM           int
++	Executions   uint64
++	NewSignal    uint64
++	StableSignal uint64
++	NewInputs    uint64
++	Hangs        uint64
++	Failures     uint64
++	Restarts     uint64
++	StateDigest  uint64
++	StateEvents  uint64
++}
++
++func makeVMFeedback(req *queue.Request, res *queue.Result, triage map[int]*triageCall) (VMFeedback, bool) {
++	if !res.ExecutorValid {
++		return VMFeedback{}, false
++	}
++	feedback := VMFeedback{
++		VM:          res.Executor.VM,
++		Executions:  1,
++		StateDigest: stateDigest(req, res),
++		StateEvents: 1,
++	}
++	for _, info := range triage {
++		feedback.NewSignal += uint64(info.newSignal.Len())
++	}
++	switch res.Status {
++	case queue.Hanged:
++		feedback.Hangs = 1
++	case queue.ExecFailure:
++		feedback.Failures = 1
++	}
++	if res.Info != nil && res.Info.Freshness == 0 {
++		feedback.Restarts = 1
++	}
++	return feedback, true
++}
++
++// stateDigest is a low-overhead behavioral-state proxy. It intentionally uses
++// stable execution properties rather than process-local or monotonically
++// changing values so repeated behavior maps to the same state.
++func stateDigest(req *queue.Request, res *queue.Result) uint64 {
++	const (
++		offset = uint64(1469598103934665603)
++		prime  = uint64(1099511628211)
++	)
++	hash := offset
++	add := func(value uint64) {
++		hash ^= value
++		hash *= prime
++	}
++	addSignal := func(values []uint64) {
++		var xor, sum uint64
++		for _, value := range values {
++			value ^= value >> 30
++			value *= 0xbf58476d1ce4e5b9
++			value ^= value >> 27
++			value *= 0x94d049bb133111eb
++			value ^= value >> 31
++			xor ^= value
++			sum += value
++		}
++		add(uint64(len(values)))
++		add(xor)
++		add(sum)
++	}
++	add(uint64(res.Status))
++	if req.Prog != nil {
++		for index, call := range req.Prog.Calls {
++			add(uint64(call.Meta.ID))
++			if res.Info != nil && index < len(res.Info.Calls) && res.Info.Calls[index] != nil {
++				info := res.Info.Calls[index]
++				add(uint64(uint32(info.Error)))
++				addSignal(info.Signal)
++			}
++		}
++	}
++	if res.Info != nil && res.Info.Extra != nil {
++		addSignal(res.Info.Extra.Signal)
++	}
++	return hash
++}
+diff --git a/pkg/fuzzer/fuzzer_test.go b/pkg/fuzzer/fuzzer_test.go
+index 319098e35..aaa394c67 100644
+--- a/pkg/fuzzer/fuzzer_test.go
++++ b/pkg/fuzzer/fuzzer_test.go
+@@ -250,3 +250,58 @@ func checkGoroutineLeaks() {
+ 		panic(err)
+ 	}
+ }
++
++func TestMakeVMFeedback(t *testing.T) {
++	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
++	assert.NoError(t, err)
++	req := &queue.Request{Prog: target.Generate(rand.NewSource(1), 2, target.DefaultChoiceTable())}
++
++	_, ok := makeVMFeedback(req, &queue.Result{Status: queue.ExecFailure}, nil)
++	assert.False(t, ok, "local failures must not be attributed to VM 0")
++
++	feedback, ok := makeVMFeedback(req, &queue.Result{
++		Executor:      queue.ExecutorID{VM: 3, Proc: 2},
++		ExecutorValid: true,
++		Status:        queue.ExecFailure,
++	}, nil)
++	assert.True(t, ok)
++	assert.Equal(t, 3, feedback.VM)
++	assert.Equal(t, uint64(1), feedback.Executions)
++	assert.Equal(t, uint64(1), feedback.Failures)
++	assert.NotZero(t, feedback.StateDigest)
++	assert.Equal(t, uint64(1), feedback.StateEvents)
++
++	feedback, ok = makeVMFeedback(&queue.Request{}, &queue.Result{
++		Executor:      queue.ExecutorID{VM: 1},
++		ExecutorValid: true,
++	}, nil)
++	assert.True(t, ok)
++	assert.Equal(t, uint64(1), feedback.StateEvents)
++}
++
++func TestStateDigestIgnoresExecutorFreshness(t *testing.T) {
++	target, err := prog.GetTarget(targets.TestOS, targets.TestArch64)
++	assert.NoError(t, err)
++	req := &queue.Request{Prog: target.Generate(rand.NewSource(1), 2, target.DefaultChoiceTable())}
++	first := &queue.Result{Info: &flatrpc.ProgInfo{Freshness: 1}}
++	later := &queue.Result{Info: &flatrpc.ProgInfo{Freshness: 1000}}
++	assert.Equal(t, stateDigest(req, first), stateDigest(req, later))
++}
++
++func TestStateDigestIgnoresSchedulerRequestType(t *testing.T) {
++	left := &queue.Request{Type: flatrpc.RequestType(1)}
++	right := &queue.Request{Type: flatrpc.RequestType(2)}
++	result := &queue.Result{}
++	assert.Equal(t, stateDigest(left, result), stateDigest(right, result))
++}
++
++func TestStateDigestIncludesSignalContent(t *testing.T) {
++	req := &queue.Request{}
++	left := &queue.Result{Info: &flatrpc.ProgInfo{Extra: &flatrpc.CallInfo{
++		Signal: []uint64{1, 2},
++	}}}
++	right := &queue.Result{Info: &flatrpc.ProgInfo{Extra: &flatrpc.CallInfo{
++		Signal: []uint64{3, 4},
++	}}}
++	assert.NotEqual(t, stateDigest(req, left), stateDigest(req, right))
++}
+diff --git a/pkg/fuzzer/job.go b/pkg/fuzzer/job.go
+index e8aec3239..96d485193 100644
+--- a/pkg/fuzzer/job.go
++++ b/pkg/fuzzer/job.go
+@@ -85,9 +85,10 @@ func mutateProgRequest(fuzzer *Fuzzer, rnd *rand.Rand) *queue.Request {
+ // During triage we understand if these programs in fact give new coverage,
+ // and if yes, minimize them and add to corpus.
+ type triageJob struct {
+-	p        *prog.Prog
+-	executor queue.ExecutorID
+-	flags    ProgFlags
++	p             *prog.Prog
++	executor      queue.ExecutorID
++	executorValid bool
++	flags         ProgFlags
+ 	fuzzer   *Fuzzer
+ 	queue    queue.Executor
+ 	// Set of calls that gave potential new coverage.
+@@ -222,7 +223,17 @@ func (job *triageJob) handleCall(call int, info *triageCall) {
+ 		Cover:    info.cover.Serialize(),
+ 		RawCover: info.rawCover,
+ 	}
+-	job.fuzzer.Config.Corpus.Save(input)
++	created := job.fuzzer.Config.Corpus.Save(input)
++	if job.fuzzer.Config.VMFeedback != nil && job.executorValid {
++		feedback := VMFeedback{
++			VM:           job.executor.VM,
++			StableSignal: uint64(info.newStableSignal.Len()),
++		}
++		if created {
++			feedback.NewInputs = 1
++		}
++		job.fuzzer.Config.VMFeedback(feedback)
++	}
+ }
+ 
+ func (job *triageJob) deflake(exec func(*queue.Request, ProgFlags) *queue.Result) (stop bool) {
+diff --git a/pkg/fuzzer/queue/queue.go b/pkg/fuzzer/queue/queue.go
+index 2ea622cd8..f53b27b5a 100644
+--- a/pkg/fuzzer/queue/queue.go
++++ b/pkg/fuzzer/queue/queue.go
+@@ -179,8 +179,9 @@ func (r *Request) initChannel() {
+ }
+ 
+ type Result struct {
+-	Info     *flatrpc.ProgInfo
+-	Executor ExecutorID
++	Info          *flatrpc.ProgInfo
++	Executor      ExecutorID
++	ExecutorValid bool // Executor identifies the VM/proc that produced this result.
+ 	Output   []byte
+ 	Status   Status
+ 	Err      error // More details in case of ExecFailure.
+diff --git a/pkg/mgrconfig/config.go b/pkg/mgrconfig/config.go
+index 2bc36f517..197808bf4 100644
+--- a/pkg/mgrconfig/config.go
++++ b/pkg/mgrconfig/config.go
+@@ -239,6 +239,14 @@ type Config struct {
+ // Experimental contains options that are not guaranteed to be backward- or forward-compatible
+ // and may be dropped at any moment.
+ type Experimental struct {
++	// Enable crash snapshot mode. In this mode, manager will create a snapshot before running executor,
++	// and the vm will be reverted to this snapshot after each crash. This should be useful when many
++	// crashes are encountered (default: false).
++	CrashSnapshot bool `json:"crash_snapshot"`
++
++	// Adaptively control the lifetime of kernel state in crash snapshot mode.
++	AdaptiveRestart AdaptiveRestartConfig `json:"adaptive_restart,omitempty"`
++
+ 	// Don't let the VM state accumulate too much by restarting
+ 	// syz-executor before most prog executions.
+ 	ResetAccState bool `json:"reset_acc_state"`
+@@ -294,3 +302,43 @@ type CovFilterCfg struct {
+ 	Functions []string `json:"functions,omitempty"`
+ 	RawPCs    []string `json:"pcs,omitempty"`
+ }
++
++type AdaptiveRestartConfig struct {
++	Enabled bool `json:"enabled"`
++
++	// Decision policy: "heuristic" keeps the threshold baseline, "bandit" uses
++	// the cost-aware online learner.
++	DecisionMode string `json:"decision_mode,omitempty"`
++	// Minimum and maximum lifetime of a snapshot lease.
++	MinMinutes int `json:"min_minutes,omitempty"`
++	MaxMinutes int `json:"max_minutes,omitempty"`
++	// Maximum lifetime of a VM before a full reboot.
++	HardMaxMinutes int `json:"hard_max_minutes,omitempty"`
++	// Lack of useful feedback after this period is considered a stall.
++	StallMinutes int `json:"stall_minutes,omitempty"`
++	// Frequency at which the policy evaluates a running VM.
++	EvaluationSeconds int `json:"evaluation_seconds,omitempty"`
++	// Full reboot after this many snapshot restores.
++	MaxSoftResets int `json:"max_soft_resets,omitempty"`
++	// A VM is degraded if recent throughput falls this percentage below its best window.
++	ThroughputDropPercent int `json:"throughput_drop_percent,omitempty"`
++	// Percentage of executions that may hang or fail in one window before the
++	// state is considered unhealthy. Executor restarts are observed by the
++	// online policy, but do not directly trigger recovery.
++	UnhealthyThreshold int `json:"unhealthy_threshold,omitempty"`
++	// Maximum number of valuable intermediate snapshots retained per VM.
++	SnapshotBankSize *int `json:"snapshot_bank_size,omitempty"`
++	// Minimum recent behavioral-state cache misses in one evaluation window
++	// required to promote a snapshot.
++	StatePromotionThreshold int `json:"state_promotion_threshold,omitempty"`
++	// Linear-UCB exploration coefficient, represented as a percentage.
++	BanditExplorationPercent int `json:"bandit_exploration_percent,omitempty"`
++	// Percentage of old observations retained on every online learner update.
++	LearningDiscountPercent int `json:"learning_discount_percent,omitempty"`
++	// Snapshot restored after a kernel crash: "clean" (the default) always restores
++	// the initial clean snapshot. "lineage" may restore an intermediate snapshot
++	// that the crashed state does not descend from.
++	CrashRecovery string `json:"crash_recovery,omitempty"`
++	// Maximum simultaneous snapshot/reboot actions. Zero selects an automatic limit.
++	MaxConcurrentActions int `json:"max_concurrent_actions,omitempty"`
++}
+diff --git a/pkg/mgrconfig/load.go b/pkg/mgrconfig/load.go
+index f53f1a705..6212de669 100644
+--- a/pkg/mgrconfig/load.go
++++ b/pkg/mgrconfig/load.go
+@@ -218,6 +218,18 @@ func Complete(cfg *Config) error {
+ 		return fmt.Errorf("if config param type is none, reproduce must be false")
+ 	}
+ 
++	if cfg.Experimental.CrashSnapshot {
++		if cfg.Snapshot {
++			return fmt.Errorf("experimental.crash_snapshot cannot be used together with snapshot")
++		}
++		if cfg.Type != "qemu" || cfg.TargetVMArch != targets.AMD64 {
++			return fmt.Errorf("experimental.crash_snapshot is currently supported only for qemu/amd64")
++		}
++	}
++	if err := cfg.Experimental.AdaptiveRestart.complete(cfg.Experimental.CrashSnapshot); err != nil {
++		return err
++	}
++
+ 	return nil
+ }
+ 
+@@ -540,3 +552,82 @@ func MatchSyscall(name, pattern string) bool {
+ 	}
+ 	return false
+ }
++
++func (cfg *AdaptiveRestartConfig) complete(crashSnapshot bool) error {
++	if !cfg.Enabled {
++		return nil
++	}
++	if !crashSnapshot {
++		return fmt.Errorf("experimental.adaptive_restart requires experimental.crash_snapshot")
++	}
++	setDefault := func(value *int, def int) {
++		if *value == 0 {
++			*value = def
++		}
++	}
++	if cfg.DecisionMode == "" {
++		cfg.DecisionMode = "bandit"
++	}
++	if cfg.CrashRecovery == "" {
++		cfg.CrashRecovery = "clean"
++	}
++	setDefault(&cfg.MinMinutes, 15)
++	setDefault(&cfg.MaxMinutes, 60)
++	setDefault(&cfg.HardMaxMinutes, 240)
++	setDefault(&cfg.StallMinutes, 20)
++	setDefault(&cfg.EvaluationSeconds, 300)
++	setDefault(&cfg.MaxSoftResets, 8)
++	setDefault(&cfg.ThroughputDropPercent, 50)
++	setDefault(&cfg.UnhealthyThreshold, 3)
++	if cfg.SnapshotBankSize == nil {
++		value := 3
++		cfg.SnapshotBankSize = &value
++	}
++	setDefault(&cfg.StatePromotionThreshold, 8)
++	setDefault(&cfg.BanditExplorationPercent, 75)
++	setDefault(&cfg.LearningDiscountPercent, 98)
++
++	if cfg.DecisionMode != "heuristic" && cfg.DecisionMode != "bandit" {
++		return fmt.Errorf("experimental.adaptive_restart.decision_mode must be heuristic or bandit")
++	}
++	if cfg.CrashRecovery != "clean" && cfg.CrashRecovery != "lineage" {
++		return fmt.Errorf("experimental.adaptive_restart.crash_recovery must be clean or lineage")
++	}
++	if cfg.MinMinutes < 1 || cfg.MaxMinutes < cfg.MinMinutes {
++		return fmt.Errorf("experimental.adaptive_restart requires 1 <= min_minutes <= max_minutes")
++	}
++	if cfg.HardMaxMinutes < cfg.MaxMinutes {
++		return fmt.Errorf("experimental.adaptive_restart requires hard_max_minutes >= max_minutes")
++	}
++	if cfg.StallMinutes < 1 {
++		return fmt.Errorf("experimental.adaptive_restart.stall_minutes must be positive")
++	}
++	if cfg.EvaluationSeconds < 1 || cfg.EvaluationSeconds > cfg.MinMinutes*60 {
++		return fmt.Errorf("experimental.adaptive_restart.evaluation_seconds must be in [1, min_minutes * 60]")
++	}
++	if cfg.MaxSoftResets < 1 {
++		return fmt.Errorf("experimental.adaptive_restart.max_soft_resets must be positive")
++	}
++	if cfg.ThroughputDropPercent < 1 || cfg.ThroughputDropPercent > 99 {
++		return fmt.Errorf("experimental.adaptive_restart.throughput_drop_percent must be in [1, 99]")
++	}
++	if cfg.UnhealthyThreshold < 1 || cfg.UnhealthyThreshold > 100 {
++		return fmt.Errorf("experimental.adaptive_restart.unhealthy_threshold must be in [1, 100]")
++	}
++	if *cfg.SnapshotBankSize < 0 || *cfg.SnapshotBankSize > 16 {
++		return fmt.Errorf("experimental.adaptive_restart.snapshot_bank_size must be in [0, 16]")
++	}
++	if cfg.StatePromotionThreshold < 1 {
++		return fmt.Errorf("experimental.adaptive_restart.state_promotion_threshold must be positive")
++	}
++	if cfg.BanditExplorationPercent < 1 || cfg.BanditExplorationPercent > 1000 {
++		return fmt.Errorf("experimental.adaptive_restart.bandit_exploration_percent must be in [1, 1000]")
++	}
++	if cfg.LearningDiscountPercent < 50 || cfg.LearningDiscountPercent > 100 {
++		return fmt.Errorf("experimental.adaptive_restart.learning_discount_percent must be in [50, 100]")
++	}
++	if cfg.MaxConcurrentActions < 0 {
++		return fmt.Errorf("experimental.adaptive_restart.max_concurrent_actions cannot be negative")
++	}
++	return nil
++}
+diff --git a/pkg/mgrconfig/load_test.go b/pkg/mgrconfig/load_test.go
+index 8526f3701..149be20c6 100644
+--- a/pkg/mgrconfig/load_test.go
++++ b/pkg/mgrconfig/load_test.go
+@@ -130,3 +130,60 @@ func TestFormatTarget(t *testing.T) {
+ 		require.Equal(t, tc.want, got)
+ 	}
+ }
++
++func TestAdaptiveRestartConfig(t *testing.T) {
++	cfg := AdaptiveRestartConfig{Enabled: true}
++	require.NoError(t, cfg.complete(true))
++	assert.Equal(t, 15, cfg.MinMinutes)
++	assert.Equal(t, 60, cfg.MaxMinutes)
++	assert.Equal(t, 240, cfg.HardMaxMinutes)
++	assert.Equal(t, "bandit", cfg.DecisionMode)
++	assert.Equal(t, "clean", cfg.CrashRecovery)
++	assert.Equal(t, 3, *cfg.SnapshotBankSize)
++	assert.Equal(t, 8, cfg.StatePromotionThreshold)
++
++	zeroSnapshots := 0
++	noSnapshotBank := AdaptiveRestartConfig{Enabled: true, SnapshotBankSize: &zeroSnapshots}
++	require.NoError(t, noSnapshotBank.complete(true))
++	assert.Zero(t, *noSnapshotBank.SnapshotBankSize)
++
++	for _, test := range []struct {
++		name          string
++		crashSnapshot bool
++		cfg           AdaptiveRestartConfig
++	}{
++		{
++			name: "requires crash snapshot",
++			cfg:  AdaptiveRestartConfig{Enabled: true},
++		},
++		{
++			name:          "bad lease range",
++			crashSnapshot: true,
++			cfg: AdaptiveRestartConfig{
++				Enabled:    true,
++				MinMinutes: 30,
++				MaxMinutes: 10,
++			},
++		},
++		{
++			name:          "bad crash recovery",
++			crashSnapshot: true,
++			cfg: AdaptiveRestartConfig{
++				Enabled:       true,
++				CrashRecovery: "intermediate",
++			},
++		},
++		{
++			name:          "bad unhealthy percentage",
++			crashSnapshot: true,
++			cfg: AdaptiveRestartConfig{
++				Enabled:            true,
++				UnhealthyThreshold: 101,
++			},
++		},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			assert.Error(t, test.cfg.complete(test.crashSnapshot))
++		})
++	}
++}
+diff --git a/pkg/rpcserver/runner.go b/pkg/rpcserver/runner.go
+index 5f80d5d01..fc31bf809 100644
+--- a/pkg/rpcserver/runner.go
++++ b/pkg/rpcserver/runner.go
+@@ -487,7 +487,8 @@ func (runner *Runner) handleExecResult(msg *flatrpc.ExecResult) error {
+ 			VM:   runner.id,
+ 			Proc: int(msg.Proc),
+ 		},
+-		Status: status,
++		ExecutorValid: true,
++		Status:        status,
+ 		Info:   msg.Info,
+ 		Output: slices.Clone(msg.Output),
+ 		Err:    resErr,
+diff --git a/pkg/tsc/tsc.go b/pkg/tsc/tsc.go
+new file mode 100644
+index 000000000..c15a87cd3
+--- /dev/null
++++ b/pkg/tsc/tsc.go
+@@ -0,0 +1,157 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++// Package tsc determines the host CPU's time-stamp counter (TSC) frequency,
++// which is needed to pin QEMU's tsc-frequency so restored snapshot guests
++// observe a stable counter rate. It is only meaningful on amd64.
++package tsc
++
++import (
++	"fmt"
++	"os/exec"
++	"regexp"
++	"runtime"
++	"slices"
++	"strconv"
++	"time"
++
++	"github.com/google/syzkaller/pkg/log"
++)
++
++// Frequency returns the host TSC frequency in Hz. It prefers the exact nominal
++// value reported by Intel via CPUID leaf 0x15 and falls back to empirically
++// calibrating the counter against a monotonic clock. Calibration is the only
++// option on AMD, which does not populate leaf 0x15, and on older Intel parts
++// that lack it.
++func Frequency() (uint64, error) {
++	if freq, err := fromCPUID(); err == nil {
++		return freq, nil
++	} else {
++		log.Logf(0, "cpuid-based TSC frequency unavailable (%v), "+
++			"falling back to RDTSC calibration", err)
++	}
++	return calibrate()
++}
++
++// fromCPUID derives the nominal TSC frequency from CPUID leaf 0x15, which Intel
++// populates with the core crystal clock and the TSC/clock ratio.
++func fromCPUID() (uint64, error) {
++	out, err := exec.Command("cpuid", "-1", "-l", "0x15").Output()
++	if err != nil {
++		return 0, fmt.Errorf("failed to run cpuid: %w", err)
++	}
++	return parseCPUID(string(out))
++}
++
++func parseCPUID(output string) (uint64, error) {
++	ratioRegexp := regexp.MustCompile(`TSC/clock ratio\s*=\s*(\d+)/(\d+)`)
++	clockRegexp := regexp.MustCompile(`nominal core crystal clock\s*=\s*(\d+)\s*Hz`)
++	ratioMatch := ratioRegexp.FindStringSubmatch(output)
++	clockMatch := clockRegexp.FindStringSubmatch(output)
++	if len(ratioMatch) != 3 || len(clockMatch) != 2 {
++		return 0, fmt.Errorf(
++			"failed to parse cpuid output, len(ratioMatch)=%d, len(clockMatch)=%d",
++			len(ratioMatch), len(clockMatch),
++		)
++	}
++
++	numerator, err := strconv.ParseUint(ratioMatch[1], 10, 64)
++	if err != nil {
++		return 0, fmt.Errorf("failed to parse TSC ratio numerator: %w", err)
++	}
++	denominator, err := strconv.ParseUint(ratioMatch[2], 10, 64)
++	if err != nil {
++		return 0, fmt.Errorf("failed to parse TSC ratio denominator: %w", err)
++	}
++	clock, err := strconv.ParseUint(clockMatch[1], 10, 64)
++	if err != nil {
++		return 0, fmt.Errorf("failed to parse nominal core crystal clock: %w", err)
++	}
++	// AMD (and some older Intel parts) report zeros here; treat that as "not
++	// available" so the caller can fall back to calibration.
++	if numerator == 0 || denominator == 0 || clock == 0 {
++		return 0, fmt.Errorf("cpuid leaf 0x15 reports no crystal clock (ratio=%d/%d, clock=%d)",
++			numerator, denominator, clock)
++	}
++	if clock > ^uint64(0)/numerator {
++		return 0, fmt.Errorf("TSC frequency calculation overflows uint64")
++	}
++	tscfreq := clock * numerator / denominator
++	if tscfreq == 0 {
++		return 0, fmt.Errorf("calculated TSC frequency is zero")
++	}
++	return tscfreq, nil
++}
++
++// calibrate measures the TSC frequency empirically by reading the counter
++// across a fixed wall-clock window. This is vendor independent and is the only
++// option on AMD, which exposes no nominal TSC frequency via CPUID.
++func calibrate() (uint64, error) {
++	if invariant, err := invariantSupported(); err == nil && !invariant {
++		log.Logf(0, "warning: CPU does not advertise an invariant TSC; "+
++			"the calibrated frequency may drift with the core clock")
++	}
++
++	// Keep the goroutine on a single OS thread to reduce scheduling noise.
++	// Cross-core consistency is guaranteed by the invariant TSC.
++	runtime.LockOSThread()
++	defer runtime.UnlockOSThread()
++
++	const (
++		warmup = 20 * time.Millisecond
++		window = 100 * time.Millisecond
++		rounds = 5
++	)
++
++	// Let caches/branch predictors settle and the CPU ramp up before sampling.
++	time.Sleep(warmup)
++
++	samples := make([]uint64, 0, rounds)
++	for range rounds {
++		if f := measure(window); f != 0 {
++			samples = append(samples, f)
++		}
++	}
++	if len(samples) == 0 {
++		return 0, fmt.Errorf("TSC calibration produced no valid samples")
++	}
++
++	// The median rejects outliers from a sample whose bracket happened to
++	// straddle a context switch or interrupt.
++	slices.Sort(samples)
++	return samples[len(samples)/2], nil
++}
++
++// measure returns the average TSC rate (Hz) over window, or 0 on a degenerate
++// measurement. The monotonic clock and the counter are sampled in the same
++// order at both ends, so the constant read latency between the two cancels out
++// and does not bias the result.
++func measure(window time.Duration) uint64 {
++	t0 := time.Now()
++	c0 := rdtsc()
++	time.Sleep(window)
++	t1 := time.Now()
++	c1 := rdtsc()
++
++	elapsed := t1.Sub(t0).Seconds()
++	if elapsed <= 0 || c1 <= c0 {
++		return 0
++	}
++	return uint64(float64(c1-c0)/elapsed + 0.5)
++}
++
++// invariantSupported reports whether CPUID leaf 0x80000007 advertises an
++// invariant (constant-rate) TSC. A missing cpuid tool is reported as an error
++// rather than a definitive "false".
++func invariantSupported() (bool, error) {
++	out, err := exec.Command("cpuid", "-1", "-l", "0x80000007").Output()
++	if err != nil {
++		return false, fmt.Errorf("failed to run cpuid: %w", err)
++	}
++	re := regexp.MustCompile(`TscInvariant\s*=\s*(true|false)`)
++	m := re.FindStringSubmatch(string(out))
++	if len(m) != 2 {
++		return false, fmt.Errorf("could not find TscInvariant flag in cpuid output")
++	}
++	return m[1] == "true", nil
++}
+diff --git a/pkg/tsc/tsc_amd64.go b/pkg/tsc/tsc_amd64.go
+new file mode 100644
+index 000000000..f40a04c0e
+--- /dev/null
++++ b/pkg/tsc/tsc_amd64.go
+@@ -0,0 +1,8 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package tsc
++
++// rdtsc returns the current value of the x86 time-stamp counter.
++// Implemented in tsc_amd64.s.
++func rdtsc() uint64
+diff --git a/pkg/tsc/tsc_amd64.s b/pkg/tsc/tsc_amd64.s
+new file mode 100644
+index 000000000..c484ca44c
+--- /dev/null
++++ b/pkg/tsc/tsc_amd64.s
+@@ -0,0 +1,18 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++#include "textflag.h"
++
++// func rdtsc() uint64
++//
++// Reads the x86 time-stamp counter. RDTSC returns the low 32 bits in EAX and
++// the high 32 bits in EDX, so they are recombined into a single uint64. The
++// leading LFENCE prevents RDTSC from being reordered ahead of the loads that
++// bracket it in the calibration loop, keeping each sample tightly bounded.
++TEXT ·rdtsc(SB), NOSPLIT, $0-8
++	LFENCE
++	RDTSC
++	SHLQ	$32, DX
++	ORQ	DX, AX
++	MOVQ	AX, ret+0(FP)
++	RET
+diff --git a/pkg/tsc/tsc_other.go b/pkg/tsc/tsc_other.go
+new file mode 100644
+index 000000000..2a4f22ef3
+--- /dev/null
++++ b/pkg/tsc/tsc_other.go
+@@ -0,0 +1,12 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++//go:build !amd64
++
++package tsc
++
++// rdtsc is meaningful only on amd64; the TSC is an x86 construct. The
++// calibration path is never reached on other architectures (the cpuid tool and
++// crash-snapshot support are x86 only), but a stub keeps the package buildable
++// everywhere.
++func rdtsc() uint64 { return 0 }
+diff --git a/pkg/tsc/tsc_test.go b/pkg/tsc/tsc_test.go
+new file mode 100644
+index 000000000..49f0542d8
+--- /dev/null
++++ b/pkg/tsc/tsc_test.go
+@@ -0,0 +1,50 @@
++// Copyright 2026 syzkaller project authors. All rights reserved.
++// Use of this source code is governed by Apache 2 LICENSE that can be found in the LICENSE file.
++
++package tsc
++
++import "testing"
++
++func TestParseCPUID(t *testing.T) {
++	tests := []struct {
++		name    string
++		output  string
++		want    uint64
++		wantErr bool
++	}{
++		{
++			name: "intel",
++			output: `CPU:
++   Time Stamp Counter/Core Crystal Clock Information (0x15):
++      TSC/clock ratio = 182/2
++      nominal core crystal clock = 38400000 Hz`,
++			want: 3494400000,
++		},
++		{
++			// AMD does not populate leaf 0x15: zeros must be rejected so the
++			// caller falls back to calibration instead of dividing by zero.
++			name: "amd_zeros",
++			output: `CPU:
++   Time Stamp Counter/Core Crystal Clock Information (0x15):
++      TSC/clock ratio = 0/0
++      nominal core crystal clock = 0 Hz`,
++			wantErr: true,
++		},
++		{
++			name:    "unparsable",
++			output:  "CPU:\n   no such leaf",
++			wantErr: true,
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			got, err := parseCPUID(tc.output)
++			if (err != nil) != tc.wantErr {
++				t.Fatalf("parseCPUID() error = %v, wantErr = %v", err, tc.wantErr)
++			}
++			if err == nil && got != tc.want {
++				t.Fatalf("parseCPUID() = %d, want %d", got, tc.want)
++			}
++		})
++	}
++}
+diff --git a/syz-manager/manager.go b/syz-manager/manager.go
+index 137e6ecd0..55ff30f8a 100644
+--- a/syz-manager/manager.go
++++ b/syz-manager/manager.go
+@@ -24,6 +24,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/google/syzkaller/dashboard/dashapi"
++	ada "github.com/google/syzkaller/pkg/adaptive"
+ 	"github.com/google/syzkaller/pkg/asset"
+ 	"github.com/google/syzkaller/pkg/corpus"
+ 	"github.com/google/syzkaller/pkg/db"
+@@ -53,6 +54,7 @@ import (
+ 	"github.com/google/syzkaller/sys/targets"
+ 	"github.com/google/syzkaller/vm"
+ 	"github.com/google/syzkaller/vm/dispatcher"
++	"github.com/google/syzkaller/vm/vmimpl"
+ )
+ 
+ var (
+@@ -73,6 +75,7 @@ type Manager struct {
+ 	reporter        *report.Reporter
+ 	crashStore      *manager.CrashStore
+ 	serv            execbackend.Server
++	rpcServ         rpcserver.Server
+ 	http            *manager.HTTPServer
+ 	servStats       rpcserver.Stats
+ 	corpus          *corpus.Corpus
+@@ -114,6 +117,8 @@ type Manager struct {
+ 
+ 	reproLoop *manager.ReproLoop
+ 
++	adaController *ada.Controller
++
+ 	Stats
+ }
+ 
+@@ -300,6 +305,9 @@ func RunManager(mode *Mode, cfg *mgrconfig.Config) {
+ 		reportGenerator:    manager.ReportGeneratorCache(cfg),
+ 	}
+ 	mgr.crashStore.Reporter = reporter
++	if cfg.Experimental.AdaptiveRestart.Enabled {
++		mgr.adaController = ada.NewController(cfg.Experimental.AdaptiveRestart, vmPool.Count())
++	}
+ 	if subsystem.HasList(cfg.TargetOS) {
+ 		mgr.crashStore.Extractor = subsystem.MakeExtractor(subsystem.GetList(cfg.TargetOS))
+ 	}
+@@ -402,6 +410,7 @@ func (mgr *Manager) initRPCServer(ctx context.Context) {
+ 	if err != nil {
+ 		log.Fatalf("failed to create rpcserver: %v", err)
+ 	}
++	mgr.rpcServ = mgr.serv.RPCServer()
+ 
+ 	if mgr.cfg.Snapshot {
+ 		snapCfg := execbackend.SnapshotConfig{
+@@ -638,11 +647,18 @@ func (mgr *Manager) loadCorpus(enabledSyscalls map[*prog.Syscall]bool) []fuzzer.
+ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updInfo dispatcher.UpdateInfo) {
+ 	mgr.mu.Lock()
+ 	serv := mgr.serv
++	rpcServ := mgr.rpcServ
+ 	mgr.mu.Unlock()
+ 	if serv == nil {
+ 		// We're in the process of switching off the RPCServer.
+ 		return
+ 	}
++	if mgr.cfg.Experimental.CrashSnapshot {
++		// TODO: rename to hybrid snapshot
++		mgr.crashSnapshotInstance(ctx, inst, rpcServ, updInfo)
++		return
++	}
++	mgr.recordRestartTimes(inst.Index(), inst.BootTime())
+ 
+ 	reps, err := serv.RunRequests(ctx, inst, mgr.reporter, updInfo)
+ 
+@@ -667,6 +683,299 @@ func (mgr *Manager) fuzzerInstance(ctx context.Context, inst *vm.Instance, updIn
+ 	}
+ }
+ 
++func makeRPCUpdateInfo(updInfo dispatcher.UpdateInfo) rpcserver.UpdateInfo {
++	if updInfo == nil {
++		return nil
++	}
++	return func(cb func(info *rpcserver.RunnerInfo)) {
++		updInfo(func(info *dispatcher.Info) {
++			runnerInfo := &rpcserver.RunnerInfo{
++				Status:         info.Status,
++				DetailedStatus: info.DetailedStatus,
++				MachineInfo:    info.MachineInfo,
++			}
++			cb(runnerInfo)
++			info.Status = runnerInfo.Status
++			info.DetailedStatus = runnerInfo.DetailedStatus
++			info.MachineInfo = runnerInfo.MachineInfo
++		})
++	}
++}
++
++func (mgr *Manager) crashSnapshotInstance(ctx context.Context, inst *vm.Instance, serv rpcserver.Server,
++	updInfo dispatcher.UpdateInfo) {
++	if serv == nil {
++		return
++	}
++	mgr.recordRestartTimes(inst.Index(), inst.BootTime())
++	updInfo(func(info *dispatcher.Info) {
++		info.Status = "saving clean snapshot"
++	})
++	fwdAddr, executorBin, err := mgr.prepareInstanceForFuzzing(inst)
++	if err != nil {
++		log.Logf(1, "VM %v: failed to prepare crash snapshot: %v", inst.Index(), err)
++		return
++	}
++	start := time.Now()
++	if err := inst.SaveSnapshot(ada.CleanSnapshotName); err != nil {
++		mgr.recordSnapshotSaveTime(inst.Index(), time.Since(start))
++		log.Logf(1, "VM %v: failed to save clean snapshot: %v", inst.Index(), err)
++		return
++	}
++	saveTime := time.Since(start)
++	mgr.recordSnapshotSave(inst.Index(), saveTime)
++	if mgr.adaController != nil {
++		mgr.adaController.RegisterCleanSnapshot(inst.Index(), inst.BootTime()+saveTime)
++	}
++	log.Logf(0, "VM %v: saved clean snapshot", inst.Index())
++
++	vmStarted := time.Now()
++	softResets := 0
++	for ctx.Err() == nil {
++		if mgr.adaController != nil {
++			decision := mgr.adaController.BeforeLease(inst.Index(), vmStarted, softResets)
++			if decision.Action == ada.RestartHard {
++				mgr.adaController.ForcedHardReset(inst.Index())
++				mgr.adaController.RecordDecision(decision)
++				log.Logf(0, "VM %v: adaptive restart decision: %v", inst.Index(), decision)
++				return
++			}
++		}
++		updInfo(func(info *dispatcher.Info) {
++			info.Status = "snapshot fuzzing"
++		})
++		injectExec := make(chan bool, 10)
++		serv.CreateInstance(inst.Index(), injectExec, makeRPCUpdateInfo(updInfo))
++		runCtx, stopLease := ctx, func() {}
++		var decisions <-chan ada.RestartDecision
++		runDuration := mgr.cfg.Timeouts.VMRunningTime
++		if mgr.adaController != nil {
++			runCtx, stopLease, decisions = mgr.adaController.StartLease(ctx, inst.Index(), vmStarted, softResets)
++			runDuration = mgr.adaController.HardMax()
++		}
++		reps, vmInfo, err := mgr.runInstanceWithExecutorFor(runCtx, runDuration, inst, fwdAddr, executorBin,
++			vm.WithExitCondition(vm.ExitTimeout),
++			vm.WithInjectExecuting(injectExec),
++			vm.WithEarlyFinishCb(func() {
++				// Depending on the crash type and kernel config, fuzzing may continue
++				// running for several seconds even after kernel has printed a crash report.
++				// This litters the log, and we want to prevent it.
++				serv.StopFuzzing(inst.Index())
++			}))
++		stopLease()
++		var decision ada.RestartDecision
++		if decisions != nil {
++			select {
++			case decision = <-decisions:
++			default:
++			}
++		}
++		if err := mgr.finishFuzzerRun(serv, inst, reps, vmInfo, err); err != nil || ctx.Err() != nil {
++			return
++		}
++		if mgr.adaController != nil && len(reps) != 0 && decision.Action != ada.RestartHard {
++			// A crash can race with a policy decision. Never checkpoint the
++			// crashed state or apply a restore chosen before the crash. Drop
++			// the censored policy action and force crash recovery, which picks
++			// clean or a snapshot outside the crashed state's lineage.
++			decision = mgr.adaController.RecoveryDecision(inst.Index(), true)
++		}
++		if decision.Action == ada.RestartHard {
++			mgr.adaController.RecordDecision(decision)
++			log.Logf(0, "VM %v: adaptive restart decision: %v", inst.Index(), decision)
++			return
++		}
++		if mgr.adaController != nil {
++			afterDecision := mgr.adaController.AfterLease(inst.Index(), vmStarted, softResets)
++			if afterDecision.Action == ada.RestartHard {
++				// AfterLease transfers an existing action reservation to the hard
++				// reset, so keep it until the replacement VM registers its clean
++				// snapshot.
++				mgr.adaController.ForcedHardReset(inst.Index())
++				mgr.adaController.RecordDecision(afterDecision)
++				log.Logf(0, "VM %v: adaptive restart decision: %v", inst.Index(), afterDecision)
++				return
++			}
++		}
++		if decision.Action == ada.RestartCheckpoint {
++			mgr.adaController.RecordDecision(decision)
++			log.Logf(0, "VM %v: adaptive restart decision: %v", inst.Index(), decision)
++			saveTime, err := promoteSnapshot(inst, decision.SnapshotName, decision.DeleteSnapshot)
++			if err != nil {
++				mgr.adaController.CompleteAction(inst.Index(), decision, saveTime, false)
++				mgr.recordSnapshotSaveTime(inst.Index(), saveTime)
++				log.Logf(1, "VM %v: failed to promote snapshot %q: %v",
++					inst.Index(), decision.SnapshotName, err)
++				return
++			}
++			mgr.adaController.CompleteAction(inst.Index(), decision, saveTime, true)
++			mgr.recordSnapshotSave(inst.Index(), saveTime)
++			log.Logf(0, "VM %v: promoted snapshot %q in %v", inst.Index(), decision.SnapshotName, saveTime)
++			continue
++		}
++		if decision.Action == ada.RestartContinue && mgr.adaController != nil {
++			decision = mgr.adaController.RecoveryDecision(inst.Index(), len(reps) != 0)
++		}
++		if decision.Action == ada.RestartSoft {
++			mgr.adaController.RecordDecision(decision)
++			log.Logf(0, "VM %v: adaptive restart decision: %v", inst.Index(), decision)
++		}
++		updInfo(func(info *dispatcher.Info) {
++			info.Status = "restoring snapshot"
++		})
++		start := time.Now()
++		snapshotName := ada.CleanSnapshotName
++		if decision.SnapshotName != "" {
++			snapshotName = decision.SnapshotName
++		}
++		if err := inst.LoadSnapshot(snapshotName); err != nil {
++			restoreTime := time.Since(start)
++			if mgr.adaController != nil {
++				mgr.adaController.CompleteAction(inst.Index(), decision, restoreTime, false)
++			}
++			mgr.recordSnapshotRestoreTime(inst.Index(), restoreTime)
++			log.Logf(1, "VM %v: failed to restore snapshot %q: %v", inst.Index(), snapshotName, err)
++			return
++		}
++		softResets++
++		restoreTime := time.Since(start)
++		if mgr.adaController != nil {
++			mgr.adaController.CompleteAction(inst.Index(), decision, restoreTime, true)
++		}
++		mgr.recordSnapshotRestore(inst.Index(), restoreTime)
++		log.Logf(0, "VM %v: restored snapshot %q in %v", inst.Index(), snapshotName, restoreTime)
++	}
++}
++
++type snapshotPromoter interface {
++	SaveSnapshot(name string) error
++	DeleteSnapshot(name string) error
++}
++
++func promoteSnapshot(store snapshotPromoter, name, evict string) (time.Duration, error) {
++	start := time.Now()
++	if err := store.SaveSnapshot(name); err != nil {
++		return time.Since(start), fmt.Errorf("save new snapshot: %w", err)
++	}
++	if evict == "" {
++		return time.Since(start), nil
++	}
++	if err := store.DeleteSnapshot(evict); err != nil {
++		return time.Since(start), fmt.Errorf("failed to delete evicted snapshot %q: %w", evict, err)
++	}
++	return time.Since(start), nil
++}
++
++func (mgr *Manager) finishFuzzerRun(serv rpcserver.Server, inst *vm.Instance, reps []*report.Report,
++	vmInfo []byte, err error) error {
++	var extraExecs []report.ExecutorInfo
++	var rep *report.Report
++	if len(reps) != 0 {
++		rep = reps[0]
++		if rep != nil && rep.Executor != nil {
++			extraExecs = []report.ExecutorInfo{*rep.Executor}
++		}
++	}
++	var memoryDump string
++	if mgr.cfg.MemoryDump && rep != nil {
++		memoryDump = mgr.extractMemoryDump(inst, rep)
++	}
++	lastExec, machineInfo := serv.ShutdownInstance(inst.Index(), rep != nil, extraExecs...)
++	if mgr.adaController != nil {
++		for _, crashReport := range reps {
++			mgr.adaController.RecordCrash(inst.Index(), crashReport.Title, ada.UsefulAdaCrash(crashReport))
++		}
++	}
++	if rep != nil {
++		rpcserver.PrependExecuting(rep, lastExec)
++		if len(vmInfo) != 0 {
++			machineInfo = append(append(vmInfo, '\n'), machineInfo...)
++		}
++		rep.MachineInfo = machineInfo
++		mgr.crashes <- &manager.Crash{
++			InstanceIndex: inst.Index(),
++			Report:        rep,
++			TailReports:   reps[1:],
++			MemoryDump:    memoryDump,
++		}
++	}
++	if err != nil {
++		log.Logf(1, "VM %v: failed with error: %v", inst.Index(), err)
++	}
++	return err
++}
++
++func (mgr *Manager) runInstanceInner(ctx context.Context, inst *vm.Instance, opts ...func(*vm.RunOptions),
++) ([]*report.Report, []byte, error) {
++	fwdAddr, executorBin, err := mgr.prepareInstanceForFuzzing(inst)
++	if err != nil {
++		return nil, nil, err
++	}
++	return mgr.runInstanceWithExecutor(ctx, inst, fwdAddr, executorBin, opts...)
++}
++
++// prepareInstanceForFuzzing prepares fuzzing instance, returns fwdAddr, executor binary path,
++// and error messages
++func (mgr *Manager) prepareInstanceForFuzzing(inst *vm.Instance) (string, string, error) {
++	if mgr.rpcServ == nil {
++		return "", "", fmt.Errorf("crash snapshot requires RPC server")
++	}
++	fwdAddr, err := inst.Forward(mgr.rpcServ.Port())
++	if err != nil {
++		return "", "", fmt.Errorf("failed to setup port forwarding: %w", err)
++	}
++
++	// If ExecutorBin is provided, it means that syz-executor is already in the image,
++	// so no need to copy it.
++	executorBin := mgr.cfg.SysTarget.ExecutorBin
++	if executorBin == "" {
++		executorBin, err = inst.Copy(mgr.cfg.ExecutorBin)
++		if err != nil {
++			return "", "", fmt.Errorf("failed to copy binary: %w", err)
++		}
++	}
++	return fwdAddr, executorBin, nil
++}
++
++func (mgr *Manager) runInstanceWithExecutor(ctx context.Context, inst *vm.Instance, fwdAddr, executorBin string,
++	opts ...func(*vm.RunOptions)) ([]*report.Report, []byte, error) {
++	return mgr.runInstanceWithExecutorFor(ctx, mgr.cfg.Timeouts.VMRunningTime, inst, fwdAddr, executorBin, opts...)
++}
++
++func (mgr *Manager) runInstanceWithExecutorFor(ctx context.Context, runDuration time.Duration,
++	inst *vm.Instance, fwdAddr, executorBin string,
++	opts ...func(*vm.RunOptions)) ([]*report.Report, []byte, error) {
++	// Run the fuzzer binary.
++	start := time.Now()
++
++	host, port, err := net.SplitHostPort(fwdAddr)
++	if err != nil {
++		return nil, nil, fmt.Errorf("failed to parse manager's address")
++	}
++	cmd := fmt.Sprintf("%v runner %v %v %v", executorBin, inst.Index(), host, port)
++	ctxTimeout, cancel := context.WithTimeout(ctx, runDuration)
++	defer cancel()
++	_, reps, err := inst.Run(ctxTimeout, mgr.reporter, cmd, opts...)
++	if err != nil {
++		if errors.Is(err, vmimpl.ErrPreempted) {
++			log.Logf(0, "VM %v: preempted while executing", inst.Index())
++		} else {
++			err = fmt.Errorf("failed to run fuzzer: %w", err)
++		}
++	} else if len(reps) == 0 {
++		log.Logf(0, "VM %v: running for %v, restarting", inst.Index(), time.Since(start))
++	}
++	var vmInfo []byte
++	if len(reps) != 0 {
++		var infoErr error
++		vmInfo, infoErr = inst.Info()
++		if infoErr != nil {
++			vmInfo = []byte(fmt.Sprintf("error getting VM info: %v\n", infoErr))
++		}
++	}
++	return reps, vmInfo, err
++}
++
+ func (mgr *Manager) emailCrash(crash *manager.Crash) {
+ 	if len(mgr.cfg.EmailAddrs) == 0 {
+ 		return
+@@ -1197,6 +1506,11 @@ func (mgr *Manager) MachineChecked(features flatrpc.Feature,
+ 				defer mgr.mu.Unlock()
+ 				return !mgr.saturatedCalls[call]
+ 			},
++			VMFeedback: func(feedback fuzzer.VMFeedback) {
++				if mgr.adaController != nil {
++					mgr.adaController.Record(feedback)
++				}
++			},
+ 			ModeKFuzzTest: mgr.cfg.Experimental.EnableKFuzzTest,
+ 		}, rnd, mgr.target)
+ 		fuzzerObj.AddCandidates(candidates)
+diff --git a/syz-manager/stats.go b/syz-manager/stats.go
+index 29c938453..37d9ddf56 100644
+--- a/syz-manager/stats.go
++++ b/syz-manager/stats.go
+@@ -6,6 +6,7 @@ package main
+ import (
+ 	"fmt"
+ 	"runtime"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/google/syzkaller/pkg/image"
+@@ -19,7 +20,18 @@ type Stats struct {
+ 	statUptime        *stat.Val
+ 	statFuzzingTime   *stat.Val
+ 	statAvgBootTime   *stat.Val
++	statRestartTime   *stat.Val
++	statRestartTimes  []*stat.Val
++	statSnapshotTimes []*stat.Val
++	statSnapshots     *stat.Val
++	statRestoreTimes  []*stat.Val
++	statRestores      *stat.Val
+ 	statCoverFiltered *stat.Val
++
++	restartTimeNanos     atomic.Uint64
++	restartTimesNanos    []atomic.Uint64
++	snapshotTimesNanos   []atomic.Uint64
++	snapshotRestoreNanos []atomic.Uint64
+ }
+ 
+ func (mgr *Manager) initStats() {
+@@ -50,6 +62,19 @@ func (mgr *Manager) initStats() {
+ 			return fmt.Sprintf("%v sec", v)
+ 		})
+ 
++	if mgr.vmPool != nil && !mgr.cfg.Snapshot {
++		mgr.initRestartTimes()
++	}
++	if mgr.cfg.Experimental.CrashSnapshot {
++		if mgr.vmPool != nil {
++			mgr.initSnapshotTimes()
++		}
++		mgr.statRestores = stat.New("snapshot restores",
++			"total number of snapshot restores", stat.Simple, stat.NoGraph)
++		mgr.statSnapshots = stat.New("snapshot saves",
++			"total number of saved snapshots", stat.Simple, stat.NoGraph)
++	}
++
+ 	stat.New("heap", "Process heap size (bytes)", stat.Graph("memory"),
+ 		func() int {
+ 			var ms runtime.MemStats
+@@ -78,3 +103,102 @@ func (mgr *Manager) initStats() {
+ 		})
+ 	mgr.statCoverFiltered = stat.New("filtered coverage", "", stat.NoGraph)
+ }
++
++func (mgr *Manager) initRestartTimes() {
++	formatDurationSecs := func(v int, _ time.Duration) string {
++		return fmt.Sprintf("%v sec", v)
++	}
++	mgr.restartTimesNanos = make([]atomic.Uint64, mgr.vmPool.Count())
++	mgr.statRestartTime = stat.New(
++		"vm restart time", "total time spent on vm restarts (sec)",
++		stat.Simple, stat.NoGraph, func() int {
++			return int(mgr.restartTimeNanos.Load() / uint64(time.Second))
++		}, formatDurationSecs)
++	for i := range mgr.vmPool.Count() {
++		index := i
++		sv := stat.New(
++			fmt.Sprintf("vm %v restart time", i),
++			fmt.Sprintf("total time spent on vm %v restarts (sec)", i),
++			stat.Graph("vm restart time"),
++			func() int {
++				return int(mgr.restartTimesNanos[index].Load() / uint64(time.Second))
++			},
++			formatDurationSecs,
++		)
++		mgr.statRestartTimes = append(mgr.statRestartTimes, sv)
++	}
++}
++
++func (mgr *Manager) initSnapshotTimes() {
++	formatDurationSecs := func(v int, _ time.Duration) string {
++		return fmt.Sprintf("%v sec", v)
++	}
++	count := mgr.vmPool.Count()
++	mgr.snapshotTimesNanos = make([]atomic.Uint64, count)
++	mgr.snapshotRestoreNanos = make([]atomic.Uint64, count)
++	for i := range count {
++		index := i
++		save := stat.New(
++			fmt.Sprintf("vm %v snapshot save time", i),
++			fmt.Sprintf("total time spent saving snapshots on vm %v (sec)", i),
++			stat.Graph("vm snapshot save time"),
++			func() int {
++				return int(mgr.snapshotTimesNanos[index].Load() / uint64(time.Second))
++			},
++			formatDurationSecs,
++		)
++		restore := stat.New(
++			fmt.Sprintf("vm %v snapshot restore time", i),
++			fmt.Sprintf("total time spent restoring snapshots on vm %v (sec)", i),
++			stat.Graph("vm snapshot restore time"),
++			func() int {
++				return int(mgr.snapshotRestoreNanos[index].Load() / uint64(time.Second))
++			},
++			formatDurationSecs,
++		)
++		mgr.statSnapshotTimes = append(mgr.statSnapshotTimes, save)
++		mgr.statRestoreTimes = append(mgr.statRestoreTimes, restore)
++	}
++}
++
++func (mgr *Manager) recordRestartTimes(index int, bootTime time.Duration) {
++	if mgr.statRestartTime == nil || bootTime <= 0 {
++		return
++	}
++	mgr.restartTimeNanos.Add(uint64(bootTime))
++	if index >= 0 && index < len(mgr.restartTimesNanos) {
++		mgr.restartTimesNanos[index].Add(uint64(bootTime))
++	}
++}
++
++func (mgr *Manager) recordSnapshotRestore(index int, restoreTime time.Duration) {
++	mgr.recordSnapshotRestoreTime(index, restoreTime)
++	if mgr.statRestores != nil && restoreTime > 0 {
++		mgr.statRestores.Add(1)
++	}
++}
++
++func (mgr *Manager) recordSnapshotRestoreTime(index int, restoreTime time.Duration) {
++	if restoreTime <= 0 {
++		return
++	}
++	if index >= 0 && index < len(mgr.snapshotRestoreNanos) {
++		mgr.snapshotRestoreNanos[index].Add(uint64(restoreTime))
++	}
++}
++
++func (mgr *Manager) recordSnapshotSave(index int, saveTime time.Duration) {
++	mgr.recordSnapshotSaveTime(index, saveTime)
++	if mgr.statSnapshots != nil && saveTime > 0 {
++		mgr.statSnapshots.Add(1)
++	}
++}
++
++func (mgr *Manager) recordSnapshotSaveTime(index int, saveTime time.Duration) {
++	if saveTime <= 0 {
++		return
++	}
++	if index >= 0 && index < len(mgr.snapshotTimesNanos) {
++		mgr.snapshotTimesNanos[index].Add(uint64(saveTime))
++	}
++}
+diff --git a/vm/qemu/qemu.go b/vm/qemu/qemu.go
+index c1a6311f0..59a5ef344 100644
+--- a/vm/qemu/qemu.go
++++ b/vm/qemu/qemu.go
+@@ -19,6 +19,7 @@ import (
+ 	"slices"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/google/syzkaller/pkg/config"
+@@ -26,6 +27,7 @@ import (
+ 	"github.com/google/syzkaller/pkg/osutil"
+ 	"github.com/google/syzkaller/pkg/report"
+ 	"github.com/google/syzkaller/pkg/report/crash"
++	"github.com/google/syzkaller/pkg/tsc"
+ 	"github.com/google/syzkaller/sys/targets"
+ 	"github.com/google/syzkaller/vm/vmimpl"
+ )
+@@ -101,13 +103,15 @@ type instance struct {
+ 	image      string
+ 	debug      bool
+ 	os         string
+-	workdir    string
++	workdir       string
++	crashSnapshot bool
+ 	vmimpl.SSHOptions
+-	timeouts    targets.Timeouts
+-	monport     int
+-	forwardPort int
+-	mon         net.Conn
+-	monEnc      *json.Encoder
++	timeouts      targets.Timeouts
++	monport       int
++	forwardPort   int
++	mon           net.Conn
++	monMu         sync.Mutex
++	monEnc        *json.Encoder
+ 	monDec      *json.Decoder
+ 	rpipe       io.ReadCloser
+ 	wpipe       io.WriteCloser
+@@ -394,16 +398,17 @@ func (pool *Pool) Create(ctx context.Context, workdir string, index int) (vmimpl
+ 
+ func (pool *Pool) ctor(workdir, sshkey, sshuser string, index int) (*instance, error) {
+ 	inst := &instance{
+-		index:      index,
+-		cfg:        pool.cfg,
+-		target:     pool.target,
+-		archConfig: pool.archConfig,
+-		version:    pool.version,
+-		image:      pool.env.Image,
+-		debug:      pool.env.Debug,
+-		os:         pool.env.OS,
+-		timeouts:   pool.env.Timeouts,
+-		workdir:    workdir,
++		index:         index,
++		cfg:           pool.cfg,
++		target:        pool.target,
++		archConfig:    pool.archConfig,
++		version:       pool.version,
++		image:         pool.env.Image,
++		debug:         pool.env.Debug,
++		os:            pool.env.OS,
++		timeouts:      pool.env.Timeouts,
++		workdir:       workdir,
++		crashSnapshot: pool.env.CrashSnapshot,
+ 		SSHOptions: vmimpl.SSHOptions{
+ 			Addr: "localhost",
+ 			Port: vmimpl.UnusedTCPPort(),
+@@ -455,9 +460,7 @@ func (inst *instance) Close() error {
+ 	if inst.wpipe != nil {
+ 		inst.wpipe.Close()
+ 	}
+-	if inst.mon != nil {
+-		inst.mon.Close()
+-	}
++	inst.closeQMP()
+ 	if inst.snapshot != nil {
+ 		inst.snapshotClose()
+ 	}
+@@ -618,6 +621,17 @@ func (inst *instance) buildQemuArgs() ([]string, error) {
+ 			return nil, err
+ 		}
+ 		args = append(args, snapshotArgs...)
++	} else if inst.crashSnapshot {
++		// Keep host CPU features while pinning the TSC frequency so restored
++		// guests observe a stable timestamp-counter rate.
++		tscfreq, err := tsc.Frequency()
++		if err != nil {
++			return nil, err
++		}
++		args = append(
++			args, "-cpu",
++			fmt.Sprintf("host,migratable=off,tsc-frequency=%v", tscfreq),
++		)
+ 	}
+ 	return args, nil
+ }
+diff --git a/vm/qemu/qmp.go b/vm/qemu/qmp.go
+index 8f2e6b7bd..524e6644d 100644
+--- a/vm/qemu/qmp.go
++++ b/vm/qemu/qmp.go
+@@ -10,10 +10,13 @@ import (
+ 	"net"
+ 	"strings"
+ 	"syscall"
++	"time"
+ 
+ 	"github.com/google/syzkaller/pkg/log"
+ )
+ 
++const qmpCommandTimeout = 10 * time.Minute
++
+ type qmpCommand struct {
+ 	Execute   string `json:"execute"`
+ 	Arguments any    `json:"arguments,omitempty"`
+@@ -45,18 +48,24 @@ func (inst *instance) qmpConnCheck() error {
+ 	}
+ 
+ 	addr := fmt.Sprintf("127.0.0.1:%v", inst.monport)
+-	conn, err := net.Dial("tcp", addr)
++	timeout := qmpCommandTimeout * max(time.Duration(1), inst.timeouts.Scale)
++	conn, err := net.DialTimeout("tcp", addr, timeout)
+ 	if err != nil {
+ 		return err
+ 	}
++	connected := false
++	defer func() {
++		if !connected {
++			conn.Close()
++		}
++	}()
+ 
+ 	monDec := json.NewDecoder(conn)
+ 	monEnc := json.NewEncoder(conn)
++	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
++		return err
++	}
+ 
+-	// QEMU sends a greeting banner (containing version and capability details)
+-	// immediately upon connection. We must decode and discard it from the TCP
+-	// stream first, otherwise subsequent command responses (e.g. to qmp_capabilities)
+-	// will be misread as the banner. We decode into an empty struct to avoid allocation.
+ 	var banner struct{}
+ 	if err := monDec.Decode(&banner); err != nil {
+ 		return err
+@@ -70,6 +79,7 @@ func (inst *instance) qmpConnCheck() error {
+ 		return err
+ 	}
+ 	inst.mon = conn
++	connected = true
+ 
+ 	return nil
+ }
+@@ -93,11 +103,19 @@ func (inst *instance) doQmp(cmd *qmpCommand) (*qmpResponse, error) {
+ }
+ 
+ func (inst *instance) qmp(cmd *qmpCommand) (any, error) {
++	inst.monMu.Lock()
++	defer inst.monMu.Unlock()
+ 	if err := inst.qmpConnCheck(); err != nil {
+ 		return nil, err
+ 	}
++	timeout := qmpCommandTimeout * max(time.Duration(1), inst.timeouts.Scale)
++	if err := inst.mon.SetDeadline(time.Now().Add(timeout)); err != nil {
++		inst.closeQMPLocked()
++		return nil, err
++	}
+ 	resp, err := inst.doQmp(cmd)
+ 	if err != nil {
++		inst.closeQMPLocked()
+ 		return nil, err
+ 	}
+ 	if resp.Error.Desc != "" {
+@@ -132,5 +150,58 @@ func (inst *instance) hmp(cmd string, cpu int) (string, error) {
+ 		killErr := syscall.Kill(inst.qemu.Process.Pid, 0)
+ 		return "", fmt.Errorf("qemu hmp command '%s' (qemu kill: %s): %w", cmd, fmt.Sprint(killErr), err)
+ 	}
+-	return resp.(string), nil
++	output, ok := resp.(string)
++	if !ok {
++		return "", fmt.Errorf("qemu hmp command %q returned %T, want string", cmd, resp)
++	}
++	return output, nil
++}
++
++func (inst *instance) closeQMP() {
++	inst.monMu.Lock()
++	defer inst.monMu.Unlock()
++	inst.closeQMPLocked()
++}
++
++func (inst *instance) closeQMPLocked() {
++	if inst.mon != nil {
++		inst.mon.Close()
++	}
++	inst.mon = nil
++	inst.monEnc = nil
++	inst.monDec = nil
++}
++
++func (inst *instance) SaveSnapshot(name string) error {
++	return inst.snapshotCommand("savevm", name)
++}
++
++func (inst *instance) LoadSnapshot(name string) error {
++	return inst.snapshotCommand("loadvm", name)
++}
++
++func (inst *instance) DeleteSnapshot(name string) error {
++	return inst.snapshotCommand("delvm", name)
++}
++
++func (inst *instance) snapshotCommand(command, name string) error {
++	if !validSnapshotName(name) {
++		return fmt.Errorf("bad snapshot name %q", name)
++	}
++	_, err := inst.hmp(command+" "+name, 0)
++	return err
++}
++
++func validSnapshotName(name string) bool {
++	if name == "" {
++		return false
++	}
++	for _, char := range name {
++		if char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
++			char >= '0' && char <= '9' || strings.ContainsRune("_.-", char) {
++			continue
++		}
++		return false
++	}
++	return true
+ }
+diff --git a/vm/vm.go b/vm/vm.go
+index c6c570ae0..a747e3c05 100644
+--- a/vm/vm.go
++++ b/vm/vm.go
+@@ -63,6 +63,7 @@ type Instance struct {
+ 	impl          vmimpl.Instance
+ 	workdir       string
+ 	index         int
++	bootTime      time.Duration
+ 	snapshotSetup bool
+ 	onClose       func()
+ }
+@@ -123,9 +124,10 @@ func Create(cfg *mgrconfig.Config, debug bool) (*Pool, error) {
+ 		Image:     cfg.Image,
+ 		SSHKey:    cfg.SSHKey,
+ 		SSHUser:   cfg.SSHUser,
+-		Timeouts:  cfg.Timeouts,
+-		Snapshot:  cfg.Snapshot,
+-		Debug:     debug,
++		Timeouts:      cfg.Timeouts,
++		Snapshot:      cfg.Snapshot,
++		CrashSnapshot: cfg.Experimental.CrashSnapshot,
++		Debug:         debug,
+ 		Config:    cfg.VM,
+ 		KernelSrc: cfg.KernelSrc,
+ 	}
+@@ -160,6 +162,7 @@ func (pool *Pool) Create(ctx context.Context, index int) (*Instance, error) {
+ 	if index < 0 || index >= pool.count {
+ 		return nil, fmt.Errorf("invalid VM index %v (count %v)", index, pool.count)
+ 	}
++	start := time.Now()
+ 	workdir, err := osutil.ProcessTempDir(pool.workdir)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to create instance temp dir: %w", err)
+@@ -176,11 +179,12 @@ func (pool *Pool) Create(ctx context.Context, index int) (*Instance, error) {
+ 	}
+ 	atomic.AddInt32(&pool.activeCount, 1)
+ 	return &Instance{
+-		pool:    pool,
+-		impl:    impl,
+-		workdir: workdir,
+-		index:   index,
+-		onClose: func() { atomic.AddInt32(&pool.activeCount, -1) },
++		pool:     pool,
++		impl:     impl,
++		workdir:  workdir,
++		index:    index,
++		bootTime: time.Since(start),
++		onClose:  func() { atomic.AddInt32(&pool.activeCount, -1) },
+ 	}, nil
+ }
+ 
+@@ -576,3 +580,37 @@ const (
+ 	vmDiagnosisStart      = "\nVM DIAGNOSIS:\n"
+ 	executedProgramsStart = "executed programs:" // syz-execprog output
+ )
++
++func (inst *Instance) SaveSnapshot(name string) error {
++	impl, ok := inst.impl.(snapshotRestorer)
++	if !ok {
++		return errors.New("this VM type does not support VM snapshots")
++	}
++	return impl.SaveSnapshot(name)
++}
++
++func (inst *Instance) LoadSnapshot(name string) error {
++	impl, ok := inst.impl.(snapshotRestorer)
++	if !ok {
++		return errors.New("this VM type does not support VM snapshots")
++	}
++	return impl.LoadSnapshot(name)
++}
++
++func (inst *Instance) DeleteSnapshot(name string) error {
++	impl, ok := inst.impl.(snapshotRestorer)
++	if !ok {
++		return errors.New("this VM type does not support VM snapshots")
++	}
++	return impl.DeleteSnapshot(name)
++}
++
++type snapshotRestorer interface {
++	SaveSnapshot(name string) error
++	LoadSnapshot(name string) error
++	DeleteSnapshot(name string) error
++}
++
++func (inst *Instance) BootTime() time.Duration {
++	return inst.bootTime
++}
+diff --git a/vm/vmimpl/vmimpl.go b/vm/vmimpl/vmimpl.go
+index a1dc154f8..74b546d1d 100644
+--- a/vm/vmimpl/vmimpl.go
++++ b/vm/vmimpl/vmimpl.go
+@@ -82,8 +82,9 @@ type Env struct {
+ 	SSHKey    string
+ 	SSHUser   string
+ 	Timeouts  targets.Timeouts
+-	Snapshot  bool
+-	Debug     bool
++	Snapshot      bool
++	CrashSnapshot bool
++	Debug         bool
+ 	Config    []byte // json-serialized VM-type-specific config
+ 	KernelSrc string
+ }
+-- 
+2.43.0
+
