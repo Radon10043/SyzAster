@@ -88,6 +88,8 @@ When modifying or adding code to SyzAster, agents must adhere to the following d
 - **Commit Author**: `Jiaming Zhang <772577952@qq.com>`.
 - **Commit Message Format**: Follow SyzPilot modular semantic commit convention: `<module>: <concise description>`.
   - Examples: `scripts: add helper scripts for Asterinas`, `patch/syzkaller: add patches for Asterinas coverage`, `configs: add fuzzing config files`.
+- **Commit Message Line & Length Limits**: Neither the subject line nor any line in the commit body may exceed 80 characters; the total commit message must not exceed 80 lines.
+- **No Push Without Explicit Consent**: Never push commits or tags to the remote repository unless explicitly instructed by the user.
 - **Modular Commits**: Separate unrelated changes into distinct, topic-focused commits.
 
 ### Documentation Style Guidelines
@@ -186,3 +188,5 @@ Before concluding any task or committing changes in SyzAster, verify:
 - The target Asterinas version remains fixed to `v0.18.1`.
 - Any updated documentation avoids numbered step prefixes (`Step 1`, `1.`, `2.`) and raw directory trees.
 - Git commits follow `<module>: <concise description>` with author set to `Jiaming Zhang <772577952@qq.com>`.
+- Commit message title and body lines never exceed 80 characters (and total message under 80 lines).
+- Commits are kept locally and never pushed to remote without explicit user instructions.
