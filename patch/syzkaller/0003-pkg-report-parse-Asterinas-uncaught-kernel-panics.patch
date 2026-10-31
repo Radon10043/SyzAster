@@ -1,0 +1,104 @@
+From e2bdf63d5a254454d6a3646a65627f69be2ac2dc Mon Sep 17 00:00:00 2001
+From: SyzAster Authors <syzaster@asterinas.org>
+Date: Sat, 31 Oct 2026 10:54:17 +0800
+Subject: [PATCH 3/4] pkg/report: parse Asterinas uncaught kernel panics
+
+Recognize Asterinas 'Uncaught panic:' reports and extract the panic
+reason and source file location into distinct crash titles.
+---
+ pkg/report/linux.go      | 30 ++++++++++++++++++++++++++++++
+ pkg/report/linux_test.go | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/pkg/report/linux.go b/pkg/report/linux.go
+index c0151799c..ea73f204d 100644
+--- a/pkg/report/linux.go
++++ b/pkg/report/linux.go
+@@ -314,6 +314,9 @@ func (ctx *linux) Parse(output []byte) *Report {
+ 	if oops == nil {
+ 		return nil
+ 	}
++	if rep := parseAsterinasPanic(output); rep != nil && rep.StartPos == startPos {
++		return rep
++	}
+ 	for questionable := false; ; questionable = true {
+ 		rep := &Report{
+ 			Output:   output,
+@@ -370,6 +373,33 @@ func (ctx *linux) Parse(output []byte) *Report {
+ 	}
+ }
+ 
++var asterinasPanicRe = regexp.MustCompile(`Uncaught panic:\r?\n[ \t]*([^\r\n]+)\r?\n[ \t]*at ([^\r\n]+)`)
++
++func parseAsterinasPanic(output []byte) *Report {
++	match := asterinasPanicRe.FindSubmatchIndex(output)
++	if match == nil || !bytes.Contains(output[match[1]:], []byte("Printing stack trace:")) {
++		return nil
++	}
++	startPos := bytes.LastIndexByte(output[:match[0]], '\n') + 1
++	reason := strings.TrimSpace(string(output[match[2]:match[3]]))
++	location := strings.Split(strings.TrimSpace(string(output[match[4]:match[5]])), "/")
++	if len(location) > 3 {
++		location = location[len(location)-3:]
++	}
++	title := fmt.Sprintf("asterinas panic: %s at %s", reason, strings.Join(location, "/"))
++	rep := &Report{
++		Title:    title,
++		Type:     crash.TitleToType(title),
++		Output:   output,
++		Report:   output[startPos:],
++		StartPos: startPos,
++		EndPos:   len(output),
++		Panicked: true,
++	}
++	setExecutorInfo(rep)
++	return rep
++}
++
+ func isTruncatedByReplay(output []byte, pos int) bool {
+ 	if pos >= len(output) {
+ 		return false
+diff --git a/pkg/report/linux_test.go b/pkg/report/linux_test.go
+index 5bd698f9b..cc33c37b1 100644
+--- a/pkg/report/linux_test.go
++++ b/pkg/report/linux_test.go
+@@ -81,6 +81,36 @@ func TestLinuxIgnores(t *testing.T) {
+ 	}
+ }
+ 
++func TestAsterinasPanicsHaveDistinctTitles(t *testing.T) {
++	reporter, _ := prepareLinuxReporter(t, targets.AMD64)
++	logs := []string{
++		"\x1b[32m[    82.115]\x1b[0m ERROR: Uncaught panic:\n" +
++			"\tassertion failed: addr.is_unicast()\n" +
++			"\tat /root/.cargo/git/checkouts/smoltcp/revision/src/iface/route.rs:150\n" +
++			"Printing stack trace:\n  1: fn 0xffffffff88000000\n",
++		"[    91.693] ERROR: Uncaught panic:\n" +
++			"\tnot implemented\n" +
++			"\tat /src/asterinas/kernel/core/src/syscall/timer_create.rs:74\n" +
++			"Printing stack trace:\n  1: fn 0xffffffff88000000\n",
++	}
++	want := []string{
++		"asterinas panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE",
++		"asterinas panic: not implemented at src/syscall/timer_create.rs:LINE",
++	}
++	for i, log := range logs {
++		if !reporter.ContainsCrash([]byte(log)) {
++			t.Fatalf("log %d was not recognized as a crash", i)
++		}
++		rep := reporter.Parse([]byte(log))
++		if rep == nil {
++			t.Fatalf("log %d was not parsed", i)
++		}
++		assert.Equal(t, want[i], rep.Title)
++		assert.True(t, rep.Panicked)
++		assert.Contains(t, string(rep.Report), "Printing stack trace:")
++	}
++}
++
+ func TestExtractFaultInjectionInfo(t *testing.T) {
+ 	reporter, _ := prepareLinuxReporter(t, targets.AMD64)
+ 	log := `
+-- 
+2.43.0
+

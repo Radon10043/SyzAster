@@ -1,0 +1,395 @@
+From ea59ae52e7b43b89caea5238c51c26adff99ded7 Mon Sep 17 00:00:00 2001
+From: SyzAster Authors <syzaster@asterinas.org>
+Date: Sat, 31 Oct 2026 10:54:17 +0800
+Subject: [PATCH 4/4] docs, pkg/mgrconfig: add Asterinas QEMU config fixture
+ and setup guide
+
+Add mgrconfig test fixture for Asterinas on QEMU and document Linux host
+to Asterinas x86-64 VM fuzzing setup.
+---
+ .gitignore                                    |   1 +
+ docs/linux/setup.md                           |   1 +
+ ...tup_linux-host_qemu-vm_asterinas-x86-64.md | 290 ++++++++++++++++++
+ pkg/mgrconfig/testdata/qemu-asterinas.cfg     |  49 +++
+ 4 files changed, 341 insertions(+)
+ create mode 100644 docs/linux/setup_linux-host_qemu-vm_asterinas-x86-64.md
+ create mode 100644 pkg/mgrconfig/testdata/qemu-asterinas.cfg
+
+diff --git a/.gitignore b/.gitignore
+index 44a340d01..b8219ff00 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -1,6 +1,7 @@
+ *~
+ *.swp
+ *.cfg
++!pkg/mgrconfig/testdata/qemu-asterinas.cfg
+ *.tmp
+ *.img
+ workdir*
+diff --git a/docs/linux/setup.md b/docs/linux/setup.md
+index 171b22e40..f9113a7aa 100644
+--- a/docs/linux/setup.md
++++ b/docs/linux/setup.md
+@@ -10,6 +10,7 @@ Instructions for a particular VM type or kernel architecture can be found on the
+ - [Setup: Linux host, QEMU vm, loongarch64 kernel](setup_linux-host_qemu-vm_loongarch64-kernel.md)
+ - [Setup: Linux host, QEMU vm, riscv64 kernel](setup_linux-host_qemu-vm_riscv64-kernel.md)
+ - [Setup: Linux host, QEMU vm, s390x kernel](setup_linux-host_qemu-vm_s390x-kernel.md)
++- [Setup: Linux host, QEMU vm, Asterinas x86-64 kernel](setup_linux-host_qemu-vm_asterinas-x86-64.md)
+ - [Setup: Linux host, Android device, arm32/64 kernel](setup_linux-host_android-device_arm-kernel.md)
+ - [Setup: Linux host, Android virtual device, x86-64 kernel](setup_linux-host_android-virtual-device_x86-64-kernel.md)
+ - [Setup: Linux isolated host](setup_linux-host_isolated.md)
+diff --git a/docs/linux/setup_linux-host_qemu-vm_asterinas-x86-64.md b/docs/linux/setup_linux-host_qemu-vm_asterinas-x86-64.md
+new file mode 100644
+index 000000000..552b9a61f
+--- /dev/null
++++ b/docs/linux/setup_linux-host_qemu-vm_asterinas-x86-64.md
+@@ -0,0 +1,290 @@
++# Setup: Linux host, QEMU VM, Asterinas x86-64 kernel
++
++This setup runs syzkaller against Asterinas by using syzkaller's existing
++`linux/amd64` target. Asterinas exposes a Linux-compatible syscall ABI, so the
++Linux syscall descriptions and executor are reused. The VM image still needs
++the same syzkaller basics as a Linux image: networking, passwordless root SSH,
++and enough userspace to run `syz-executor`.
++
++The helper below builds an Asterinas NixOS image with Dropbear SSH and emits a
++`syz-manager` config for QEMU. It compiles `cargo-osdk` from the chosen
++Asterinas tree with `OSDK_LOCAL_DEV=1` so that the kernel and OSDK dependencies
++come from the same release source. New builds enable real, per-thread PC
++coverage by default (`KCOV=1`); use `--no-cover` for an old, uninstrumented
++image or to build with `KCOV=0`.
++
++Both host-side regression tests and in-VM validation (`tools/check-asterinas-kcov.sh`,
++`syz-manager -mode smoke-test`, and continuous coverage-guided fuzzing with
++growing corpus and coverage) are supported. Do not treat config generation or a
++host-only test pass alone as evidence that coverage works in the guest; always
++run the guest KCOV check and `syz-manager` verification steps below when
++testing a new kernel build.
++
++## Requirements
++
++- The Asterinas `v0.18.1` release source (commit
++  `d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`). The helper defaults to
++  `VERSION=0.18.1` and checks this Git commit for full builds. Use
++  `--allow-version-mismatch` only for experiments with another source revision.
++- The Asterinas build prerequisites, including Nix, QEMU, OVMF, OpenSSL, and the
++  `VDSO_LIBRARY_DIR` environment required by Asterinas.
++- Rust and Cargo with the toolchain specified by the Asterinas checkout; the
++  helper installs a source-matched OSDK under its output directory.
++- The Asterinas KCOV changes: the `KCOV=1` build switch and trace-PC callbacks,
++  `/dev/kcov` with Linux-compatible PC-only ioctls and a shared writable mmap,
++  and `/proc/kallsyms` with `_stext` and `_etext`. An unmodified v0.18.1 kernel
++  does not provide this interface. Apply the KCOV changes as well as the
++  compatibility fixes below before using the default coverage mode.
++- A syzkaller checkout on the Linux host, and `readelf` (binutils) to verify
++  that the coverage object retains its symbols and debug info.
++- KVM access if the generated config keeps `-enable-kvm`.
++
++## Build the Image
++
++Check out the release and apply the compatibility and KCOV patches shipped with this
++integration:
++
++```bash
++git -C $ASTERINAS switch --detach v0.18.1
++git -C $ASTERINAS apply $SYZKALLER/tools/asterinas-v0.18.1.patch
++git -C $ASTERINAS apply $SYZKALLER/tools/asterinas-v0.18.1-kcov.patch
++```
++
++Build syzkaller first:
++
++```bash
++cd $SYZKALLER
++make
++```
++
++Then build the Asterinas image and manager config:
++
++```bash
++cd $SYZKALLER
++tools/create-asterinas-image.sh \
++	--asterinas $ASTERINAS \
++	--out $SYZKALLER/.workdir \
++	--version 0.18.1 \
++	--ovmf /usr/share/qemu/OVMF.fd
++```
++
++The script writes:
++
++- `$SYZKALLER/.workdir/asterinas.img`
++- `$SYZKALLER/.workdir/asterinas.id_rsa`
++- `$SYZKALLER/.workdir/asterinas-syzkaller.cfg`
++- `$SYZKALLER/.workdir/kernel/vmlinux` (coverage mode only)
++
++The helper pins full builds to the development profile (`RELEASE=0`,
++`RELEASE_LTO=0`) and `$ASTERINAS/target`. OSDK's original unstripped ELF is
++`target/x86_64-unknown-none/debug/asterinas-osdk-bin`, not the boot image or
++OSDK bundle, which may have been stripped or transformed. The helper copies
++that ELF byte-for-byte to `kernel/vmlinux` for syzkaller's Linux symbolization
++and coverage-report backend. Coverage generation fails if the original ELF
++is missing or lacks symbols/debug info; it never silently disables coverage.
++
++The generated Asterinas NixOS image uses a minimal stage-2 init to start
++Dropbear without systemd. It installs the public half of the generated SSH key
++for root, sets a random root password hash so key login is not rejected as a
++locked account, and disables password authentication. OpenSSH tools remain in
++the image for syzkaller's legacy SCP transfer. The helper also builds Asterinas
++with `CONSOLE=ttyS0` so syzkaller can collect kernel output from QEMU's serial
++stream.
++
++Asterinas currently configures the virtio guest network as `eth0` with
++`10.0.2.15/24` and gateway `10.0.2.2`, which matches QEMU user networking and
++the host-forwarded SSH port that syzkaller's QEMU backend creates.
++
++To regenerate only the `syz-manager` config for an image that already
++exists, reuse the output directory and SSH key from the original image build:
++
++```bash
++tools/create-asterinas-image.sh \
++	--asterinas $ASTERINAS \
++	--out $SYZKALLER/.workdir \
++	--image /path/to/asterinas.img \
++	--config-only \
++	--kernel-obj /path/to/matching/kernel-objects
++```
++
++`--config-only` requires the existing private key at
++`$SYZKALLER/.workdir/asterinas.id_rsa`; it does not prove that the image boots
++or that the version under test is fuzzable. Its generated Build ID ends in
++`-unverified`. A full build uses the source tree's actual `VERSION`, Git
++revision, and dirty state in the Build ID, including when
++`--allow-version-mismatch` is used.
++
++`--kernel-obj` is config-only and must contain an unstripped `vmlinux` from
++**the exact KCOV-instrumented kernel installed in that image**. It is copied
++to the output's `kernel/vmlinux`. Omit the option only when the matching ELF
++is still at the default Cargo path above. Keep the original source checkout
++available at `--asterinas`: both `kernel_src` and `kernel_build_src` point to
++it. The script checks for symbols/debug info but cannot verify that a
++config-only ELF matches the guest image or that it was instrumented.
++
++For an old image without KCOV, explicitly opt out instead:
++
++```bash
++tools/create-asterinas-image.sh \
++	--asterinas $ASTERINAS \
++	--out $SYZKALLER/.workdir \
++	--image /path/to/old-asterinas.img \
++	--config-only --no-cover
++```
++
++`--no-cover` does not require a kernel object and omits all three kernel
++object/source paths from the generated config. For full image builds the
++same flag passes `KCOV=0` instead of the default `KCOV=1`.
++
++## Check the coverage interface
++
++Before building, check that the pinned Rust compiler produces real callbacks:
++
++```bash
++cd $ASTERINAS
++tools/test-kcov-instrumentation.sh
++```
++
++The KCOV patch instruments `aster_core` only and keeps OSTD, including the
++recording callback, uninstrumented. LTO is disabled to preserve that boundary.
++This provides synchronous PC feedback for the syscall implementation; it does
++not measure every kernel crate, comparisons, or interrupt/background work.
++
++For an already booted, trusted test VM, the host-side helper builds the static
++ABI test, copies it over SSH, runs it with a timeout, and removes guest temporary
++files. It requires both exit status zero and the real-PC PASS marker; an absent
++KCOV device (status 77) is a failure, not a successful skip:
++
++```bash
++bash $SYZKALLER/tools/check-asterinas-kcov.sh \
++    "$ASTERINAS" "$SYZKALLER/.workdir/asterinas.id_rsa" "$SSH_PORT"
++```
++
++This requires `cc`, static libc/pthread libraries, OpenSSH, and GNU `timeout` on
++the host. The optional fourth argument is the SSH host (default `127.0.0.1`).
++It uses a temporary known-hosts file with trust-on-first-use, so use it only
++against your isolated test VM. This validates the KCOV ABI, not syzkaller's
++coverage feedback loop.
++
++Alternatively, build the guest-side ABI test on the host, copy it into the
++running guest, and execute it as root:
++
++```bash
++cc -static -pthread -O2 -Wall -Wextra -Werror \
++    $ASTERINAS/tools/kcov-smoke.c -o kcov-smoke
++scp -O -P $SSH_PORT -i $SYZKALLER/.workdir/asterinas.id_rsa \
++    kcov-smoke root@127.0.0.1:/tmp/kcov-smoke
++ssh -p $SSH_PORT -i $SYZKALLER/.workdir/asterinas.id_rsa \
++    root@127.0.0.1 /tmp/kcov-smoke
++```
++
++Use the forwarded SSH port shown by QEMU for `$SSH_PORT`. Require `PASS` and
++exit status zero. Exit status 77 means KCOV is absent. The test checks nonzero
++PCs within the kernel text range, buffer bounds, mapping restrictions, task
++ownership, fork, exit cleanup, and disabling coverage. Then verify syzkaller's
++own coverage feedback as described below.
++
++## Run syz-manager
++
++First run the smoke test. This boots a VM and runs simple programs to confirm
++that syzkaller can copy and execute binaries inside the Asterinas guest:
++
++```bash
++$SYZKALLER/bin/syz-manager \
++	-config $SYZKALLER/.workdir/asterinas-syzkaller.cfg \
++	-mode smoke-test
++```
++
++The helper can also run this check immediately after creating the image:
++
++```bash
++tools/create-asterinas-image.sh \
++	--asterinas $ASTERINAS \
++	--out $SYZKALLER/.workdir \
++	--version 0.18.1 \
++	--ovmf /usr/share/qemu/OVMF.fd \
++	--run-smoke-test
++```
++
++After the smoke test passes, start continuous fuzzing:
++
++```bash
++$SYZKALLER/bin/syz-manager \
++	-config $SYZKALLER/.workdir/asterinas-syzkaller.cfg
++```
++
++For a new kernel version, leave the manager running for several minutes and
++check that `exec total` continues to increase in its periodic log lines.
++In the default coverage mode, require nonzero and growing coverage as well
++as increasing executions; `coverage=0` is not a successful coverage bring-up.
++Only `--no-cover` intentionally runs without real coverage. A successful
++smoke test alone does not establish sustained fuzzing or coverage growth. Check
++`$SYZKALLER/.workdir/crashes` for any reports from the run.
++For Asterinas panics, the reporter uses the assertion and source path to keep
++different bugs separate. Inspect `crashes/<id>/log0` as well as `report0` for
++the complete raw VM output.
++With one VM, the generated config disables automatic reproduction so a crash
++does not monopolize the only VM. With two or more VMs, it enables reproduction;
++individual crashes can also be reproduced later using `syz-repro`.
++
++The generated manager config intentionally sets:
++
++- `"target": "linux/amd64"` to reuse Linux syscall descriptions.
++- `"cover": true` by default, with `kernel_obj` pointing to the output's
++  `kernel` directory and `kernel_src`/`kernel_build_src` to the Asterinas tree.
++  `--no-cover` sets `cover` to false; only in this opt-out mode does syzkaller
++  tolerate a missing `/proc/kallsyms` and skip module address parsing.
++- `"experimental": { "remote_cover": false }` because Asterinas implements
++  synchronous per-thread PC coverage, not Linux remote/background coverage.
++  Comparison tracing is unsupported: the existing feature probe detects the
++  failed `KCOV_ENABLE(KCOV_TRACE_CMP)` ioctl and leaves comparisons disabled.
++- `"reproduce": false` for the default single-VM configuration, keeping the
++  fuzzer active after a kernel crash.
++- `"sandbox": "none"` to avoid relying on Linux namespace details during the
++  initial bring-up.
++- QEMU disk snapshots enabled at the VM layer, while syzkaller executor
++  snapshot mode remains disabled.
++
++It also disables several Linux-only or high-assumption syscall families such as
++BPF, KVM pseudo-syscalls, io_uring, keyrings, USB pseudo-syscalls, and
++`syz_mount_image`. Re-enable them only after the corresponding Asterinas
++subsystem is known to be ready for fuzzing. The tested Asterinas v0.18.1 tree
++has local fixes for a `PTRACE_TRACEME` parent-lock deadlock and a
++`set_tid_address` panic; verify that the kernel under test has equivalent fixes
++before leaving these syscalls enabled.
++The initial-namespace socket pseudo-syscalls are disabled because Asterinas
++does not currently expose `/proc/self/ns/net`.
++The config also disables the existing KCOV-specific open description,
++`openat$auto_fuse_conn_congestion_threshold_ops_control`, which opens
++`/sys/kernel/debug/kcov` despite its name. This checkout has no dedicated
++`ioctl$KCOV*` or `syz_open_dev$kcov` descriptions to disable; general `ioctl`
++and device-open syscall families remain available.
++
++The guest stage-2 hook tries to create `/sys/kernel/debug/kcov` as a symlink
++to `/dev/kcov` without mounting debugfs. Some sysfs implementations do not
++allow that directory/symlink. All executor KCOV opens (including feature
++probes) therefore use a common helper that prefers Linux's debugfs path and
++falls back to `/dev/kcov` only on `ENOENT`. Other Linux open errors, such as
++`EACCES`, are not hidden by the fallback.
++
++Host-only regression tests can be run without Nix, Rust, or a VM (a C/C++
++compiler and binutils are required):
++
++```bash
++bash -n tools/create-asterinas-image.sh
++python3 -I tools/create-asterinas-image_test.py
++bash -n tools/check-asterinas-kcov.sh
++python3 -I tools/check-asterinas-kcov_test.py
++```
++
++## Notes
++
++The `v0.18.1` release requires local boot/install and kernel fixes for this
++setup. A successful run against the release commit plus these fixes is not a
++claim that an unmodified release image can fuzz. The generated Build ID records
++the source commit and marks a modified worktree as `-dirty`. Passing
++`--allow-version-mismatch` is useful for validating syzkaller plumbing with
++another checkout; it does not prove v0.18.1 fuzzing.
++
++If QEMU cannot find OVMF, pass the correct firmware path with `--ovmf`. If KVM
++is unavailable, pass `--no-kvm` so the generated config uses TCG.
+diff --git a/pkg/mgrconfig/testdata/qemu-asterinas.cfg b/pkg/mgrconfig/testdata/qemu-asterinas.cfg
+new file mode 100644
+index 000000000..bd93fc9be
+--- /dev/null
++++ b/pkg/mgrconfig/testdata/qemu-asterinas.cfg
+@@ -0,0 +1,49 @@
++{
++	"name": "asterinas-v0.18.1",
++	"target": "linux/amd64",
++	"http": "127.0.0.1:56741",
++	"workdir": "/syzkaller/.workdir",
++	"image": "./testdata/disk.raw",
++	"syzkaller": "./testdata/syzkaller",
++	"tag": "asterinas-v0.18.1",
++	"sandbox": "none",
++	"cover": true,
++	"kernel_obj": "./testdata",
++	"kernel_src": "/asterinas",
++	"kernel_build_src": "/asterinas",
++	"experimental": {
++		"remote_cover": false
++	},
++	"reproduce": false,
++	"snapshot": false,
++	"procs": 2,
++	"disable_syscalls": [
++		"add_key",
++		"bpf",
++		"io_uring_enter",
++		"io_uring_register",
++		"io_uring_setup",
++		"keyctl",
++		"openat$auto_fuse_conn_congestion_threshold_ops_control",
++		"perf_event_open",
++		"request_key",
++		"syz_init_net_socket",
++		"syz_io_uring_*",
++		"syz_kvm_*",
++		"syz_mount_image",
++		"syz_read_part_table",
++		"syz_socket_connect_nvme_tcp",
++		"syz_usb_*"
++	],
++	"type": "qemu",
++	"vm": {
++		"count": 1,
++		"cpu": 2,
++		"mem": 8192,
++		"qemu": "qemu-system-x86_64",
++		"qemu_args": "-enable-kvm -cpu host -machine q35,kernel-irqchip=split -bios /usr/share/qemu/OVMF.fd -device virtio-blk-pci,drive=hd0,disable-legacy=on,disable-modern=off -device isa-debug-exit,iobase=0xf4,iosize=0x04",
++		"image_device": "drive if=none,format=raw,id=hd0,file=",
++		"network_device": "virtio-net-pci,disable-legacy=on,disable-modern=off,csum=off,ctrl_guest_offloads=off,ctrl_mac_addr=off,ctrl_rx_extra=off,ctrl_rx=off,ctrl_vlan=off,ctrl_vq=off,event_idx=off,guest_announce=off,guest_csum=off,guest_ecn=off,guest_tso4=off,guest_tso6=off,guest_ufo=off,guest_uso4=off,guest_uso6=off,host_ecn=off,host_tso4=off,host_tso6=off,host_ufo=off,host_uso=off,indirect_desc=off,mrg_rxbuf=off,queue_reset=off",
++		"snapshot": true
++	}
++}
+-- 
+2.43.0
+

@@ -1,0 +1,162 @@
+From c450e24e9da184d534a3e02f0afb6ab5eb460fd1 Mon Sep 17 00:00:00 2001
+From: SyzAster Authors <syzaster@asterinas.org>
+Date: Sat, 31 Oct 2026 10:54:17 +0800
+Subject: [PATCH 2/4] pkg/vminfo, pkg/cover: support __stext fallback and
+ optional kallsyms
+
+Allow ELF coverage symbol resolution to fall back to __stext when _stext
+is absent, and skip module address parsing from /proc/kallsyms when
+coverage is disabled on Linux-compatible kernels.
+---
+ pkg/cover/backend/elf.go      | 11 +++++++++++
+ pkg/cover/backend/elf_test.go | 23 +++++++++++++++++++++++
+ pkg/vminfo/linux.go           |  9 +++++++++
+ pkg/vminfo/linux_test.go      | 19 +++++++++++++++++++
+ pkg/vminfo/vminfo.go          |  2 +-
+ 5 files changed, 63 insertions(+), 1 deletion(-)
+
+diff --git a/pkg/cover/backend/elf.go b/pkg/cover/backend/elf.go
+index b8c771ef9..4748d46fb 100644
+--- a/pkg/cover/backend/elf.go
++++ b/pkg/cover/backend/elf.go
+@@ -257,10 +257,21 @@ func getLinuxPCBase(cfg *mgrconfig.Config) (uint64, error) {
+ 	if err != nil {
+ 		return 0, err
+ 	}
++	return findLinuxPCBase(allSymbols)
++}
++
++func findLinuxPCBase(allSymbols []elf.Symbol) (uint64, error) {
++	var fallback uint64
+ 	for _, sym := range allSymbols {
+ 		if sym.Name == "_stext" {
+ 			return sym.Value, nil
+ 		}
++		if sym.Name == "__stext" && fallback == 0 {
++			fallback = sym.Value
++		}
++	}
++	if fallback != 0 {
++		return fallback, nil
+ 	}
+ 	return 0, fmt.Errorf("no _stext symbol")
+ }
+diff --git a/pkg/cover/backend/elf_test.go b/pkg/cover/backend/elf_test.go
+index 56272ac66..3c6cbb27c 100644
+--- a/pkg/cover/backend/elf_test.go
++++ b/pkg/cover/backend/elf_test.go
+@@ -4,9 +4,32 @@
+ package backend
+ 
+ import (
++	"debug/elf"
+ 	"testing"
+ )
+ 
++func TestFindLinuxPCBase(t *testing.T) {
++	base, err := findLinuxPCBase([]elf.Symbol{
++		{Name: "__stext", Value: 0xffffffff8804b000},
++		{Name: "_stext", Value: 0xffffffff81000000},
++	})
++	if err != nil || base != 0xffffffff81000000 {
++		t.Fatalf("expected _stext preference, got %#x (%v)", base, err)
++	}
++
++	base, err = findLinuxPCBase([]elf.Symbol{
++		{Name: "other", Value: 0x1000},
++		{Name: "__stext", Value: 0xffffffff8804b000},
++	})
++	if err != nil || base != 0xffffffff8804b000 {
++		t.Fatalf("expected __stext fallback, got %#x (%v)", base, err)
++	}
++
++	if _, err := findLinuxPCBase([]elf.Symbol{{Name: "other", Value: 0x1000}}); err == nil {
++		t.Fatalf("expected error when neither _stext nor __stext is present")
++	}
++}
++
+ func TestGetTraceCallbackType(t *testing.T) {
+ 	inputData := map[int][]string{
+ 		TraceCbNone: {
+diff --git a/pkg/vminfo/linux.go b/pkg/vminfo/linux.go
+index a76a0f1d0..ea7a366a6 100644
+--- a/pkg/vminfo/linux.go
++++ b/pkg/vminfo/linux.go
+@@ -7,8 +7,10 @@ import (
+ 	"bufio"
+ 	"bytes"
+ 	"cmp"
++	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"path"
+ 	"regexp"
+ 	"slices"
+@@ -20,6 +22,7 @@ import (
+ 
+ type linux struct {
+ 	vmType string
++	cover  bool
+ }
+ 
+ func (linux) RequiredFiles() []string {
+@@ -51,6 +54,12 @@ func (linux linux) parseModules(files filesystem) ([]*KernelModule, error) {
+ 	if linux.vmType == targets.GVisor || linux.vmType == targets.Starnix {
+ 		return nil, nil
+ 	}
++	if !linux.cover {
++		if _, err := files.ReadFile("/proc/kallsyms"); errors.Is(err, fs.ErrNotExist) {
++			// No addresses are needed without coverage; some Linux-compatible kernels omit kallsyms.
++			return nil, nil
++		}
++	}
+ 	var modules []*KernelModule
+ 	re := regexp.MustCompile(`(\w+) ([0-9]+) .*(0[x|X][a-fA-F0-9]+)[^\n]*`)
+ 	modulesText, _ := files.ReadFile("/proc/modules")
+diff --git a/pkg/vminfo/linux_test.go b/pkg/vminfo/linux_test.go
+index a047a1f23..5d33fd520 100644
+--- a/pkg/vminfo/linux_test.go
++++ b/pkg/vminfo/linux_test.go
+@@ -89,6 +89,25 @@ func TestLinuxSyscalls(t *testing.T) {
+ 	}
+ }
+ 
++func TestLinuxModulesWithoutKallsyms(t *testing.T) {
++	files := filesystem{}
++	modules, err := (linux{cover: false}).parseModules(files)
++	require.NoError(t, err)
++	require.Empty(t, modules)
++
++	_, err = (linux{cover: true}).parseModules(files)
++	require.ErrorContains(t, err, "failed to get _stext symbol")
++
++	files["/proc/kallsyms"] = &flatrpc.FileInfo{
++		Name: "/proc/kallsyms", Exists: true,
++		Data: []byte("ffffffff81000000 T _stext\nffffffff82000000 R _etext\n"),
++	}
++	modules, err = (linux{cover: false}).parseModules(files)
++	require.NoError(t, err)
++	require.Len(t, modules, 1)
++	require.Equal(t, uint64(0xffffffff81000000), modules[0].Addr)
++}
++
+ func TestReadKVMInfo(t *testing.T) {
+ 	if runtime.GOOS != "linux" {
+ 		t.Skip("not linux")
+diff --git a/pkg/vminfo/vminfo.go b/pkg/vminfo/vminfo.go
+index 5252648b9..cfb6ab526 100644
+--- a/pkg/vminfo/vminfo.go
++++ b/pkg/vminfo/vminfo.go
+@@ -60,7 +60,7 @@ func New(cfg *Config) *Checker {
+ 	var impl checker
+ 	switch cfg.Target.OS {
+ 	case targets.Linux:
+-		impl = &linux{vmType: cfg.VMType}
++		impl = &linux{vmType: cfg.VMType, cover: cfg.Cover}
+ 	case targets.NetBSD:
+ 		impl = new(netbsd)
+ 	case targets.OpenBSD:
+-- 
+2.43.0
+
