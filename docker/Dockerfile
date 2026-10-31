@@ -29,6 +29,11 @@ RUN apt-get install -y pkg-config libzstd-dev libxml2-dev zlib1g-dev sshfs netca
 RUN apt-get install -y debian-archive-keyring lsd ripgrep repo bubblewrap net-tools pciutils iproute2 iptables bridge-utils strace
 RUN apt-get install -y grub-efi-amd64 grub-efi-amd64-bin grub-efi-amd64-dbg grub2-common mtools xorriso
 RUN apt-get install -y parted fdisk util-linux udev dosfstools e2fsprogs exfatprogs openssl binutils libnuma1 libpixman-1-dev
+RUN apt-get install -y poppler-utils poppler-data && \
+    ln -sf /usr/share/poppler/cMap /cMap && \
+    ln -sf /usr/share/poppler/cidToUnicode /cidToUnicode && \
+    ln -sf /usr/share/poppler/unicodeMap /unicodeMap && \
+    ln -sf /usr/share/poppler/nameToUnicode /nameToUnicode
 
 # Ensure /usr/share/qemu/OVMF.fd exists for QEMU UEFI boot
 RUN mkdir -p /usr/share/qemu && \
@@ -86,6 +91,24 @@ RUN mkdir -p /etc/nix && \
     nix-channel --add https://github.com/NixOS/nixpkgs/archive/${NIXPKGS_COMMIT}.tar.gz nixos && \
     nix-channel --update && \
     nix-env -iA nixpkgs.nixos-install-tools
+
+# Install MiKTeX for building technical reports
+RUN curl -fsSL https://miktex.org/download/key | gpg --dearmor --yes -o /usr/share/keyrings/miktex-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/miktex-keyring.gpg] https://miktex.org/download/ubuntu noble universe" > /etc/apt/sources.list.d/miktex.list
+RUN apt-get update
+RUN apt-get install -y miktex
+RUN miktexsetup --shared=yes finish && \
+    initexmf --admin --set-config-value "[MPM]AutoInstall=1" && \
+    mpm --admin --install=elegantpaper
+
+# Install draw.io desktop, Xvfb, and diagram fonts for exporting report figures (images/*.drawio -> PDF)
+ARG DRAWIO_VERSION=32.6.1
+RUN apt-get install -y xvfb libgbm1 libasound2t64
+RUN apt-get install -y fonts-noto-cjk fonts-dejavu-core
+RUN wget -q --show-progress --progress=bar:force:noscroll \
+        https://github.com/jgraph/drawio-desktop/releases/download/v${DRAWIO_VERSION}/drawio-amd64-${DRAWIO_VERSION}.deb && \
+    apt-get install -y ./drawio-amd64-${DRAWIO_VERSION}.deb && \
+    rm drawio-amd64-${DRAWIO_VERSION}.deb
 
 # Install fzf and lazygit for interactive debugging
 RUN git clone --progress --depth 1 https://github.com/junegunn/fzf.git /root/.fzf && \
