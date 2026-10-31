@@ -58,6 +58,62 @@ docker exec -it syzaster-test bash
 
 We recommend storing fuzzers, kernels, VM images, and fuzzing workdirs under the mounted `/vol` directory for persistence.
 
+## Minimal Runnable Example
+
+The examples below exercise SyzAster's core functionality at increasing cost. Run them inside the Docker container from the repository root (`$SYZASTER`). The first two examples need only this repository and finish within seconds; the third additionally needs a booted Asterinas VM.
+
+### Framekernel-Selective Instrumentation Check
+
+This example verifies the core idea of SyzAster: the coverage instrumentation boundary coincides with the framekernel TCB boundary.
+
+- **Entry**: `bin/check-kcov-inst` (source: `src/bin/check-kcov-inst.rs`, `src/pkg/kcov.rs`).
+- **Input**: none. The tool generates a small `#![no_std]` probe crate with a branch, compiles it through the `kcov-rustc` wrapper once as `aster_core` and once as `ostd` for `x86_64-unknown-none`, and inspects both object files with the built-in ELF parser. Optionally pass `--asterinas $ASTERINAS` to use the wrapper shipped in a patched Asterinas tree instead.
+- **Command**:
+  ```bash
+  make
+  ./bin/check-kcov-inst
+  ```
+- **Expected output** (exit code `0`):
+  ```text
+  PASS: safe kernel gets trace-pc callbacks; OSTD remains uninstrumented
+  ```
+- **Assertions**: `aster_core.o` must reference `__sanitizer_cov_trace_pc`, and `ostd.o` must not. If either assertion fails, the tool prints a `FAIL: ...` line naming the violated condition and exits with a nonzero code.
+
+### Regression Test Suite
+
+This example runs the Rust unit and integration tests covering the ELF parser, the instrumentation wrapper and checker, the image builder script, and the helper tools.
+
+- **Entry**: `make test` (equivalent to `cargo test`; test sources in `src/` and `tests/`).
+- **Input**: none. The tests use built-in fixtures and temporary directories.
+- **Command**:
+  ```bash
+  make test
+  ```
+- **Expected output** (exit code `0`): every test binary reports a line of the form
+  ```text
+  test result: ok. N passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; ...
+  ```
+- **Assertions**: no test reports `FAILED`, and the summary of every test binary shows `0 failed`.
+
+### Runtime `/dev/kcov` ABI Check in a VM
+
+This example verifies the patched kernel end to end: real kernel PCs are recorded through `/dev/kcov` with Linux-compatible semantics.
+
+- **Entry**: `bin/check-asterinas-kcov` (source: `src/pkg/kcov.rs`; guest test program: `tools/kcov-smoke.c` added by the Asterinas patch).
+- **Input**: a patched Asterinas source tree (`$ASTERINAS`), an image built with `create-image.sh` (`$IMAGE`), and the SSH port of the booted VM. Prepare them as described in [Prepare and Patch Asterinas Kernel](#prepare-and-patch-asterinas-kernel-v0181) and [Build the Asterinas NixOS Image](#build-the-asterinas-nixos-image).
+- **Command**:
+  ```bash
+  ./scripts/asterinas/qemu.sh -i $IMAGE/asterinas.img -p 10022 &
+  # Wait until the guest accepts SSH connections, then:
+  ./bin/check-asterinas-kcov $ASTERINAS $IMAGE/asterinas.id_rsa 10022
+  ```
+- **Expected output** (exit code `0`; `getpid` and `getppid` give the number of PCs recorded for each system call, and the counts and addresses vary between runs):
+  ```text
+  PASS: real KCOV PCs, getpid=<COUNT> getppid=<COUNT> first_pc=<ADDRESS>; bounds, mmap, ownership, fork and exit checked
+  KCOV ABI validated. Next run syz-manager smoke-test and verify coverage growth during fuzzing.
+  ```
+- **Assertions**: the guest program checks that every PC recorded for `getpid` lies within `[_stext, _etext)` as exported by `/proc/kallsyms`, that invalid `ioctl` arguments return the Linux error codes (`EINVAL`, `EBUSY`), that only complete shared mappings are accepted, that a tampered shared counter never causes an out-of-bounds write, and that ownership, `fork`, and thread exit behave as on Linux. Any violated check prints `FAIL line <N>: <condition>` and the tool exits with a nonzero code.
+
 ## Build and Run SyzAster
 
 This section walks through building SyzAster, patching Asterinas `v0.18.1`, building the NixOS VM image, verifying KCOV instrumentation, and launching coverage-guided fuzzing.
