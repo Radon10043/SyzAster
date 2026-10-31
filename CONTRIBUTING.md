@@ -63,4 +63,4 @@ Keep the division of responsibility between Shell and Rust:
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the same terms as the project (`Apache-2.0 AND MPL-2.0`, as declared in `Cargo.toml`). Kernel patches for Asterinas follow the MPL-2.0 license of the Asterinas project, and syzkaller patches follow the Apache-2.0 license of syzkaller.
+By contributing, you agree that your contributions are licensed under the license of the part you modify, as listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md): original SyzAster code is licensed under MIT, patches in `patch/asterinas/` follow the MPL-2.0 license of Asterinas, and patches in `patch/syzkaller/` follow the Apache-2.0 license of syzkaller.

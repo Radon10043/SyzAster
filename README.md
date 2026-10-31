@@ -319,3 +319,7 @@ All core verification, compiler-wrapping, and statistical evaluation tools are w
 ## Reproduce Evaluation
 
 Please follow [`experiment/docs/setup-env.md`](experiment/docs/setup-env.md) to set up the evaluation directory structure (`fuzzer/`, `kernel/`, `image/`, `experiment/`). You can then launch multi-instance whole-kernel, subsystem (`fs`, `net`, `process`, `mm`), and ablation (`KCOV=1` vs. `KCOV=0`) fuzzing campaigns using our [Docker Compose configurations](experiment/docs/docker-compose.md).
+
+## License
+
+SyzAster's original code is licensed under the [MIT License](LICENSE). The Asterinas patches in `patch/asterinas/` are licensed under [MPL-2.0](LICENSE-MPL), and the syzkaller patches in `patch/syzkaller/` are licensed under [Apache-2.0](LICENSE-APACHE), following their upstream projects. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full license map and third-party sources.
