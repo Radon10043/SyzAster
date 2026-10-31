@@ -1,12 +1,13 @@
 # Licenses and Third-Party Notices
 
-SyzAster combines original code with patches for two upstream open-source projects. Each part is distributed under the license listed below.
+SyzAster combines original code, original documentation, and patches for two upstream open-source projects. Copyright (c) 2026 RustTrace Team, University of Science and Technology Beijing, unless stated otherwise. Each part is distributed under the license listed below.
 
 ## License Map
 
 | Path | License | License text |
 |---|---|---|
-| Everything not listed below, including `src/`, `tests/`, `scripts/`, `configs/`, `docs/`, `docker/`, `experiment/`, and `report/` | MIT | [`LICENSE`](LICENSE) |
+| Source code not listed below, including `src/`, `tests/`, `scripts/`, `configs/`, `docker/`, and the configurations, orchestration files, and scripts in `experiment/` | MIT | [`LICENSE`](LICENSE) |
+| Documentation: `report/` (technical report), `docs/`, `experiment/docs/`, and all Markdown files (`*.md`) such as `README.md` and `CONTRIBUTING.md` | CC BY-SA 4.0 | [`LICENSE-CC-BY-SA`](LICENSE-CC-BY-SA) |
 | `patch/asterinas/` | MPL-2.0, following Asterinas | [`LICENSE-MPL`](LICENSE-MPL) |
 | `patch/syzkaller/` | Apache-2.0, following syzkaller | [`LICENSE-APACHE`](LICENSE-APACHE) |
 | `syzkaller/` (Git submodule) | Apache-2.0, unmodified upstream source | [`syzkaller/LICENSE`](https://github.com/google/syzkaller/blob/master/LICENSE) |

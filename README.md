@@ -322,4 +322,4 @@ Please follow [`experiment/docs/setup-env.md`](experiment/docs/setup-env.md) to 
 
 ## License
 
-SyzAster's original code is licensed under the [MIT License](LICENSE). The Asterinas patches in `patch/asterinas/` are licensed under [MPL-2.0](LICENSE-MPL), and the syzkaller patches in `patch/syzkaller/` are licensed under [Apache-2.0](LICENSE-APACHE), following their upstream projects. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full license map and third-party sources.
+SyzAster's original code is licensed under the [MIT License](LICENSE), and its documentation, including this README, `docs/`, and the technical report in `report/`, is licensed under [CC BY-SA 4.0](LICENSE-CC-BY-SA). The Asterinas patches in `patch/asterinas/` are licensed under [MPL-2.0](LICENSE-MPL), and the syzkaller patches in `patch/syzkaller/` are licensed under [Apache-2.0](LICENSE-APACHE), following their upstream projects. See [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) for the full license map and third-party sources.

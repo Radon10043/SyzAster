@@ -63,4 +63,4 @@ Keep the division of responsibility between Shell and Rust:
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the license of the part you modify, as listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md): original SyzAster code is licensed under MIT, patches in `patch/asterinas/` follow the MPL-2.0 license of Asterinas, and patches in `patch/syzkaller/` follow the Apache-2.0 license of syzkaller.
+By contributing, you agree that your contributions are licensed under the license of the part you modify, as listed in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md): original SyzAster code is licensed under MIT, documentation (Markdown files, `docs/`, `experiment/docs/`, and `report/`) is licensed under CC BY-SA 4.0, patches in `patch/asterinas/` follow the MPL-2.0 license of Asterinas, and patches in `patch/syzkaller/` follow the Apache-2.0 license of syzkaller.
