@@ -3,7 +3,7 @@ name = "syzaster"
 version = "0.1.0"
 edition = "2021"
 description = "SyzAster: Coverage-Guided Kernel Fuzzing Prototype Tool for Asterinas Framekernel"
-license = "Apache-2.0 AND MPL-2.0"
+license = "MIT"
 
 [lib]
 name = "syzaster"
