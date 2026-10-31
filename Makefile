@@ -39,7 +39,7 @@ patch-syzkaller:
 		fi; \
 	done
 
-unpatch-syzkaller reset-syzkaller:
+unpatch-syzkaller:
 	cd syzkaller && git clean -fd && git reset --hard HEAD && rm -f pkg/mgrconfig/testdata/qemu-asterinas.cfg
 
 syzkaller: patch-syzkaller
