@@ -14,7 +14,7 @@ The prefix of each instruction indicates the execution context:
 
 (host) Build the self-contained SyzAster Docker image:
 ```bash
-git clone --recurse-submodules https://github.com/asterinas/SyzAster /tmp/SyzAster
+git clone --recurse-submodules https://github.com/Radon10043/SyzAster /tmp/SyzAster
 cd /tmp/SyzAster
 docker build -t syzaster:latest --network host -f ./docker/Dockerfile .
 ```
@@ -43,7 +43,7 @@ mkdir -p kernel fuzzer image experiment
 (container.syzaster) Clone SyzAster into `$EXPERIMENT_ROOT/fuzzer/SyzAster`:
 ```bash
 cd $EXPERIMENT_ROOT/fuzzer
-git clone --recurse-submodules https://github.com/asterinas/SyzAster
+git clone --recurse-submodules https://github.com/Radon10043/SyzAster
 cd SyzAster
 git submodule update --init --recursive
 ```
