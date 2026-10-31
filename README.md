@@ -123,7 +123,7 @@ This section walks through building SyzAster, patching Asterinas `v0.18.1`, buil
 Clone SyzAster together with its `syzkaller` submodule:
 ```bash
 export SYZASTER=/vol/SyzAster
-git clone --recurse-submodules https://github.com/asterinas/SyzAster $SYZASTER
+git clone --recurse-submodules https://github.com/Radon10043/SyzAster $SYZASTER
 # If cloned without --recurse-submodules, run:
 git -C $SYZASTER submodule update --init --recursive
 ```
