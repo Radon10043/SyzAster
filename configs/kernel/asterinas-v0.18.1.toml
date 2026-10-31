@@ -1,0 +1,22 @@
+# Asterinas v0.18.1 Kernel Build Configuration for SyzAster
+
+[kernel]
+name = "asterinas"
+version = "0.18.1"
+commit = "d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5"
+target_arch = "x86_64"
+rust_toolchain = "nightly-2026-07-21"
+patch_dir = "patch/asterinas/v0.18.1"
+
+[build]
+kcov = 1
+release = 0
+release_lto = 0
+boot_protocol = "linux-efi-handover64"
+console = "ttyS0"
+log_level = "error"
+cargo_profile_dev_lto = false
+cargo_profile_release_lto = false
+rustc_wrapper = "tools/kcov-rustc.sh"
+unstripped_elf = "target/x86_64-unknown-none/debug/asterinas-osdk-bin"
+nixos_image = "target/nixos/asterinas.img"
