@@ -6,11 +6,11 @@
 ```bash
 cd $EXPERIMENT_ROOT/fuzzer/SyzAster
 
-# 1. Build all SyzAster Rust tools into ./bin/ and run the Rust test suite
+# Build all SyzAster Rust tools into ./bin/ and run the Rust test suite
 make
 make test
 
-# 2. Apply the SyzAster patch series (patch/syzkaller/*.patch) to the syzkaller submodule and build syzkaller
+# Apply the SyzAster patch series (patch/syzkaller/*.patch) to the syzkaller submodule and build syzkaller
 make syzkaller
 ```
 

@@ -2,7 +2,7 @@
 
 Use `scripts/asterinas/create-image.sh` to build the KCOV-instrumented Asterinas kernel, generate the NixOS disk image with Dropbear SSH and stage-2 init, and stage the exact unstripped `vmlinux` ELF (`target/x86_64-unknown-none/debug/asterinas-osdk-bin`).
 
-## 1. Coverage-Guided Image (`KCOV=1`) for `v0.18.1`
+## Coverage-Guided Image (`KCOV=1`) for `v0.18.1`
 
 (container.syzaster):
 ```bash
@@ -17,7 +17,7 @@ This produces:
 - `$EXPERIMENT_ROOT/image/asterinas/v0.18.1/asterinas.id_rsa`
 - `$EXPERIMENT_ROOT/image/asterinas/v0.18.1/kernel/vmlinux`
 
-## 2. Baseline Uninstrumented Image (`KCOV=0`, `--no-cover`)
+## Baseline Uninstrumented Image (`KCOV=0`, `--no-cover`)
 
 For ablation experiments comparing `SyzAster` (`KCOV=1`) against uninstrumented fuzzing (`KCOV=0`):
 
@@ -29,7 +29,7 @@ $EXPERIMENT_ROOT/fuzzer/SyzAster/scripts/asterinas/create-image.sh \
     --no-cover
 ```
 
-## 3. Validate Live Guest KCOV ABI
+## Validate Live Guest KCOV ABI
 
 Start the VM in the background using `scripts/asterinas/qemu.sh` and run `bin/check-asterinas-kcov`:
 

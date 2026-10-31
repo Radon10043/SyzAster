@@ -9,7 +9,7 @@ This guide explains how **SyzAster** runs coverage-guided `syzkaller` against As
 - Rust toolchain `nightly-2026-07-21` with `rust-src`, `rustc-dev`, `llvm-tools-preview`, and `x86_64-unknown-none`.
 - SyzAster patch series applied to both `asterinas` (`patch/asterinas/v0.18.1/`) and `syzkaller` (`patch/syzkaller/`).
 
-## Step 1: Patch Asterinas and Syzkaller
+## Patch Asterinas and Syzkaller
 
 Apply the Asterinas compatibility and KCOV patch series:
 ```bash
@@ -24,7 +24,7 @@ make
 make syzkaller
 ```
 
-## Step 2: Build the Asterinas NixOS Image
+## Build the Asterinas NixOS Image
 
 Run `scripts/asterinas/create-image.sh`:
 ```bash
@@ -53,23 +53,23 @@ For an uninstrumented image (`KCOV=0`), pass `--no-cover`:
 
 `scripts/asterinas/create-image.sh` pins full builds to the development profile (`RELEASE=0`, `RELEASE_LTO=0`) and `$ASTERINAS/target`. OSDK's original unstripped ELF is `target/x86_64-unknown-none/debug/asterinas-osdk-bin`. The script inspects the ELF section headers and symbol table to verify that `.symtab`, `.debug_info`, and a defined `__sanitizer_cov_trace_pc` symbol exist before staging it byte-for-byte to `kernel/vmlinux`.
 
-## Step 3: Configure `syz-manager` and Run Fuzzing
+## Configure `syz-manager` and Run Fuzzing
 
-1. **Prepare `syz-manager` Configuration**:
-   Copy [`configs/fuzz/asterinas/kernel.cfg`](../configs/fuzz/asterinas/kernel.cfg) (or `nocover.cfg`) to `$SYZASTER/.workdir/fuzz.cfg` and replace the `__XXX__` placeholders (`__KERNEL_VERSION__`, `__WORKDIR__`, `__IMAGE__`, `__SYZKALLER__`, `__KERNEL__`, `__VMCOUNT__`).
-2. **Compiler Instrumentation Check**:
-   ```bash
-   ./bin/check-kcov-inst --asterinas $ASTERINAS
-   ```
-3. **Live Guest KCOV ABI Check**:
-   ```bash
-   ./bin/check-asterinas-kcov \
-       "$ASTERINAS" \
-       "$SYZASTER/.workdir/asterinas.id_rsa" \
-       "$SSH_PORT"
-   ```
-4. **Smoke Test & Continuous Fuzzing**:
-   ```bash
-   ./syzkaller/bin/syz-manager -config $SYZASTER/.workdir/fuzz.cfg -mode smoke-test
-   ./syzkaller/bin/syz-manager -config $SYZASTER/.workdir/fuzz.cfg
-   ```
+- **Prepare `syz-manager` Configuration**:
+  Copy [`configs/fuzz/asterinas/kernel.cfg`](../configs/fuzz/asterinas/kernel.cfg) (or `nocover.cfg`) to `$SYZASTER/.workdir/fuzz.cfg` and replace the `__XXX__` placeholders (`__KERNEL_VERSION__`, `__WORKDIR__`, `__IMAGE__`, `__SYZKALLER__`, `__KERNEL__`, `__VMCOUNT__`).
+- **Compiler Instrumentation Check**:
+  ```bash
+  ./bin/check-kcov-inst --asterinas $ASTERINAS
+  ```
+- **Live Guest KCOV ABI Check**:
+  ```bash
+  ./bin/check-asterinas-kcov \
+      "$ASTERINAS" \
+      "$SYZASTER/.workdir/asterinas.id_rsa" \
+      "$SSH_PORT"
+  ```
+- **Smoke Test & Continuous Fuzzing**:
+  ```bash
+  ./syzkaller/bin/syz-manager -config $SYZASTER/.workdir/fuzz.cfg -mode smoke-test
+  ./syzkaller/bin/syz-manager -config $SYZASTER/.workdir/fuzz.cfg
+  ```

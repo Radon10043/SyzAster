@@ -50,11 +50,11 @@ git submodule update --init --recursive
 
 ## Table of Contents
 
-1. [Setup `fuzzer/SyzAster`](setup-fuzzer_SyzAster.md)
-2. [Setup `kernel/asterinas`](setup-kernel_asterinas.md)
-3. [Setup `image/asterinas`](setup-image_asterinas.md)
-4. [Setup `compose.env`](setup-env_file.md)
-5. [Run Evaluation with Docker Compose](docker-compose.md)
+- [Setup `fuzzer/SyzAster`](setup-fuzzer_SyzAster.md)
+- [Setup `kernel/asterinas`](setup-kernel_asterinas.md)
+- [Setup `image/asterinas`](setup-image_asterinas.md)
+- [Setup `compose.env`](setup-env_file.md)
+- [Run Evaluation with Docker Compose](docker-compose.md)
 
 ## Run Evaluation & Statistical Analysis
 
