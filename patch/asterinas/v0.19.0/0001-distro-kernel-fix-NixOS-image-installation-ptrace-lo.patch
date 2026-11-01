@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SyzAster Authors <syzaster@asterinas.org>
+Date: Sun, 1 Nov 2026 21:31:37 +0800
+Subject: [PATCH 1/2] distro, kernel: fix NixOS image installation, ptrace
+ lock, and set_tid_address
+
+Ensure loop partition device nodes exist during NixOS installation,
+allow ttyS0 serial console, fix PTRACE_TRACEME parent lock ordering
+deadlock under Yama, and fix sys_set_tid_address panic when replacing
+clear_child_tid.
+---
+ distro/aster_nixos_installer/default.nix      |  1 +
+ .../templates/aster-nixos-install             | 41 +++++++++++++-
+ .../templates/aster_configuration.nix         |  1 +
+ distro/etc_nixos/modules/core.nix             | 19 ++++++-
+ distro/etc_nixos/overlays/systemd/default.nix |  6 +++
+ kernel/core/src/syscall/ptrace.rs             |  7 ++-
+ kernel/core/src/syscall/set_tid_address.rs    |  9 +---
+ .../process/ptrace/traceme_no_cap.c           | 53 +++++++++++++++++++
+ .../src/regression/process/run_test.sh        |  3 ++
+ .../src/regression/process/set_tid_address.c  | 22 ++++++++
+ 10 files changed, 149 insertions(+), 13 deletions(-)
+ create mode 100644 test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
+ create mode 100644 test/initramfs/src/regression/process/set_tid_address.c
+
+diff --git a/distro/aster_nixos_installer/default.nix b/distro/aster_nixos_installer/default.nix
+index d4fa82bfb..37a78a006 100644
+--- a/distro/aster_nixos_installer/default.nix
++++ b/distro/aster_nixos_installer/default.nix
+@@ -38,6 +38,7 @@ let
+       aster-target-platform = target_platform;
+       aster-substituters = extra-substituters;
+       aster-trusted-public-keys = extra-trusted-public-keys;
++      nixos-install = "${pkgs.nixos-install}/bin/nixos-install";
+     };
+     isExecutable = true;
+   };
+diff --git a/distro/aster_nixos_installer/templates/aster-nixos-install b/distro/aster_nixos_installer/templates/aster-nixos-install
+index c028102f3..bad6c4f08 100644
+--- a/distro/aster_nixos_installer/templates/aster-nixos-install
++++ b/distro/aster_nixos_installer/templates/aster-nixos-install
+@@ -101,11 +101,48 @@ else
+     BOOT_DEVICE="${DISK}1"
+     ROOT_DEVICE="${DISK}2"
+ fi
+-if [ ! -b "${BOOT_DEVICE}" ] && [ ! -b "${ROOT_DEVICE}" ]; then
++create_block_device_node() {
++    device_path="$1"
++    device_name="${device_path#/dev/}"
++    sysfs_dev="/sys/class/block/${device_name}/dev"
++    if [ ! -b "${device_path}" ] && [ -r "${sysfs_dev}" ]; then
++        IFS=: read -r major minor < "${sysfs_dev}"
++        mknod "${device_path}" b "${major}" "${minor}"
++    fi
++}
++
++remove_stale_block_device_node() {
++    device_path="$1"
++    device_name="${device_path#/dev/}"
++    if [ -b "${device_path}" ] && [ ! -e "/sys/class/block/${device_name}" ]; then
++        rm -f "${device_path}"
++    fi
++}
++
++remove_stale_block_device_node "${BOOT_DEVICE}"
++remove_stale_block_device_node "${ROOT_DEVICE}"
++
++if [ ! -b "${BOOT_DEVICE}" ] || [ ! -b "${ROOT_DEVICE}" ]; then
+     parted ${DISK} -- mklabel gpt
+     parted ${DISK} -- mkpart ESP fat32 1MB 512MB
+     parted ${DISK} -- mkpart root ext2 512MB 100%
+     parted ${DISK} -- set 1 esp on
++    for _ in $(seq 1 10); do
++        blockdev --rereadpt ${DISK} || true
++        partprobe ${DISK} || true
++        partx -a ${DISK} || partx -u ${DISK} || true
++        udevadm settle || true
++        create_block_device_node "${BOOT_DEVICE}"
++        create_block_device_node "${ROOT_DEVICE}"
++        if [ -b "${BOOT_DEVICE}" ] && [ -b "${ROOT_DEVICE}" ]; then
++            break
++        fi
++        sleep 0.2
++    done
++    if [ ! -b "${BOOT_DEVICE}" ] || [ ! -b "${ROOT_DEVICE}" ]; then
++        echo "Error: failed to create partition devices ${BOOT_DEVICE} and ${ROOT_DEVICE}" >&2
++        exit 1
++    fi
+     echo "partition finished"
+ 
+     mkfs.fat -F 32 -n boot "${BOOT_DEVICE}"
+@@ -171,7 +208,7 @@ SYSTEM_CLOSURE=$(nix-build "${NIXPKGS_PATH}/nixos" -A system \
+     --no-out-link)
+ 
+ export PATH=${PATH}:/run/current-system/sw/bin
+-nixos-install --root ${BUILD_DIR} --no-root-passwd \
++@nixos-install@ --root ${BUILD_DIR} --no-root-passwd \
+     --system "${SYSTEM_CLOSURE}" \
+     "${COMMON_NIX_ARGS[@]}"
+ 
+diff --git a/distro/aster_nixos_installer/templates/aster_configuration.nix b/distro/aster_nixos_installer/templates/aster_configuration.nix
+index 9f40f2843..1df0bff96 100644
+--- a/distro/aster_nixos_installer/templates/aster_configuration.nix
++++ b/distro/aster_nixos_installer/templates/aster_configuration.nix
+@@ -81,6 +81,7 @@
+       };
+       console = lib.mkOption {
+         type = lib.types.enum [
++          "ttyS0"
+           "tty0"
+           "hvc0"
+         ];
+diff --git a/distro/etc_nixos/modules/core.nix b/distro/etc_nixos/modules/core.nix
+index 8d6b239c4..3bc69f7bd 100644
+--- a/distro/etc_nixos/modules/core.nix
++++ b/distro/etc_nixos/modules/core.nix
+@@ -18,12 +18,16 @@ let
+     NEW_INIT=""
+     BREAK=""
+     ARGS=""
++    CONSOLE="hvc0"
+ 
+     for arg in "$@"; do
+       case "$arg" in
+         root=*)
+           NEW_ROOT=''${arg#root=}
+           ;;
++        console=*)
++          CONSOLE=''${arg#console=}
++          ;;
+         init=*)
+           NEW_INIT=''${arg#init=}
+           ;;
+@@ -56,8 +60,21 @@ let
+     mount -t ext2 "$NEW_ROOT" /sysroot
+     mount -t proc none /sysroot/proc
+     mount --move /dev /sysroot/dev
++    if [ ! -c /sysroot/dev/console ]; then
++      case "$CONSOLE" in
++        ttyS0)
++          mknod /sysroot/dev/console c 4 64 2>/dev/null || true
++          ;;
++        tty0)
++          mknod /sysroot/dev/console c 4 0 2>/dev/null || true
++          ;;
++        hvc0|*)
++          mknod /sysroot/dev/console c 229 0 2>/dev/null || true
++          ;;
++      esac
++    fi
+ 
+-    exec switch_root /sysroot "$NEW_INIT" "$ARGS"
++    exec switch_root /sysroot "$NEW_INIT" $ARGS
+   '';
+ 
+   initramfs = pkgs.makeInitrd {
+diff --git a/distro/etc_nixos/overlays/systemd/default.nix b/distro/etc_nixos/overlays/systemd/default.nix
+index 283e552f1..c1dc3f926 100644
+--- a/distro/etc_nixos/overlays/systemd/default.nix
++++ b/distro/etc_nixos/overlays/systemd/default.nix
+@@ -87,4 +87,10 @@ final: prev: {
+ 
+     '';
+   });
++
++  # When aster_nixos.disable-systemd is enabled, the NixOS system builder still
++  # evaluates pkgs.systemd for user units, path units, and basic tools. Pointing
++  # systemd directly at aster_systemd avoids building unpatched upstream systemd.
++  systemd = final.aster_systemd;
++  systemdMinimal = final.aster_systemd;
+ }
+diff --git a/kernel/core/src/syscall/ptrace.rs b/kernel/core/src/syscall/ptrace.rs
+index 65562b43b..d9ae50f4b 100644
+--- a/kernel/core/src/syscall/ptrace.rs
++++ b/kernel/core/src/syscall/ptrace.rs
+@@ -35,8 +35,11 @@ pub(super) fn sys_ptrace(
+     match request {
+         PtraceRequest::PTRACE_TRACEME => {
+             let current_thread = current_thread!();
+-            let parent_guard = ctx.process.parent().lock();
+-            let parent_main_thread = parent_guard.process().upgrade().unwrap().main_thread();
++            // Yama's ancestor check may lock this process's parent again.
++            let parent_main_thread = {
++                let parent_guard = ctx.process.parent().lock();
++                parent_guard.process().upgrade().unwrap().main_thread()
++            };
+ 
+             do_ptrace_attach(&parent_main_thread, current_thread)?;
+         }
+diff --git a/kernel/core/src/syscall/set_tid_address.rs b/kernel/core/src/syscall/set_tid_address.rs
+index 92274e5b0..8c16c9965 100644
+--- a/kernel/core/src/syscall/set_tid_address.rs
++++ b/kernel/core/src/syscall/set_tid_address.rs
+@@ -6,14 +6,7 @@ use crate::prelude::*;
+ pub(super) fn sys_set_tid_address(tidptr: Vaddr, ctx: &Context) -> Result<SyscallReturn> {
+     debug!("tidptr = 0x{:x}", tidptr);
+ 
+-    let clear_child_tid = ctx.thread_local.clear_child_tid().get();
+-    if clear_child_tid != 0 {
+-        // According to manuals at https://man7.org/linux/man-pages/man2/set_tid_address.2.html
+-        // We need to write 0 to clear_child_tid and do futex wake
+-        todo!()
+-    }
+-
+-    ctx.thread_local.set_child_tid().set(clear_child_tid);
++    ctx.thread_local.clear_child_tid().set(tidptr);
+ 
+     let tid = ctx.posix_thread.tid();
+     Ok(SyscallReturn::Return(tid as _))
+diff --git a/test/initramfs/src/regression/process/ptrace/traceme_no_cap.c b/test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
+new file mode 100644
+index 000000000..f45307c7c
+--- /dev/null
++++ b/test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#define _GNU_SOURCE
++
++#include <linux/capability.h>
++#include <signal.h>
++#include <sys/ptrace.h>
++#include <sys/syscall.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "../../common/test.h"
++
++FN_SETUP(drop_cap_sys_ptrace)
++{
++	struct __user_cap_header_struct header = {
++		.version = _LINUX_CAPABILITY_VERSION_3,
++	};
++	struct __user_cap_data_struct data[2];
++	CHECK(syscall(SYS_capget, &header, data));
++
++	const unsigned int bit = 1U << CAP_SYS_PTRACE;
++	data[0].effective &= ~bit;
++	data[0].permitted &= ~bit;
++	data[0].inheritable &= ~bit;
++	CHECK(syscall(SYS_capset, &header, data));
++}
++END_SETUP()
++
++FN_TEST(traceme_without_cap_sys_ptrace)
++{
++	pid_t child = fork();
++	if (child == 0)
++		_exit(ptrace(PTRACE_TRACEME, 0, NULL, NULL) == 0 ? 0 : 1);
++	TEST_RES(child, _ret > 0);
++	if (child < 0)
++		return;
++
++	int status = 0;
++	pid_t got = 0;
++	for (int i = 0; i < 100; i++) {
++		got = waitpid(child, &status, WNOHANG);
++		if (got != 0)
++			break;
++		usleep(10000);
++	}
++	if (got == 0)
++		kill(child, SIGKILL);
++	TEST_RES(got, _ret == child);
++	if (got == child)
++		TEST_RES(status, WIFEXITED(_ret) && WEXITSTATUS(_ret) == 0);
++}
++END_TEST()
+diff --git a/test/initramfs/src/regression/process/run_test.sh b/test/initramfs/src/regression/process/run_test.sh
+index ba645c24b..7acf16c6d 100755
+--- a/test/initramfs/src/regression/process/run_test.sh
++++ b/test/initramfs/src/regression/process/run_test.sh
+@@ -47,6 +47,7 @@ fi
+ 
+ ./ptrace/ptrace
+ ./ptrace/set_options
++./ptrace/traceme_no_cap
+ 
+ if [ "$(uname -m)" = "x86_64" ]; then
+     ./ptrace/debugger
+@@ -57,6 +58,8 @@ fi
+ ./sched/sched_param_getset
+ ./sched/sched_param_idle
+ 
++./set_tid_address
++
+ ./signal/kill
+ ./signal/parent_death_signal
+ ./signal/pidfd_send_signal
+diff --git a/test/initramfs/src/regression/process/set_tid_address.c b/test/initramfs/src/regression/process/set_tid_address.c
+new file mode 100644
+index 000000000..ef3e4700d
+--- /dev/null
++++ b/test/initramfs/src/regression/process/set_tid_address.c
+@@ -0,0 +1,22 @@
++// SPDX-License-Identifier: MPL-2.0
++
++#define _GNU_SOURCE
++
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include "../common/test.h"
++
++FN_TEST(replace_clear_child_tid)
++{
++	int first = 123;
++	int second = 456;
++	long tid = syscall(SYS_gettid);
++
++	TEST_RES(syscall(SYS_set_tid_address, &first), _ret == tid);
++	TEST_RES(syscall(SYS_set_tid_address, &second), _ret == tid);
++	TEST_RES(first, _ret == 123);
++	TEST_RES(second, _ret == 456);
++	TEST_RES(syscall(SYS_set_tid_address, NULL), _ret == tid);
++}
++END_TEST()
+-- 
+2.43.0
+
