@@ -14,6 +14,7 @@ This document serves as the authoritative operational guide for AI agents and hu
 - **`patch/`**: Curated patch sets for upstream components.
   - **`patch/syzkaller/`**: Patches adapting `syzkaller` for Asterinas (`/dev/kcov` fallback, symbol resolution, panic parsing, configuration templates, adaptive snapshot restoration).
   - **`patch/asterinas/v0.18.1/`**: Patches providing task-scoped KCOV runtime, `/dev/kcov` character device, and `/proc/kallsyms` for Asterinas `v0.18.1`.
+  - **`patch/asterinas/v0.19.0/`**: Patches providing task-scoped KCOV runtime, `/dev/kcov` character device, and `/proc/kallsyms` for Asterinas `v0.19.0`.
 - **`scripts/`**: Standalone, pure Shell scripts for kernel patching, image generation, VM launching, and crash reproduction.
 - **`configs/`**: Reusable configuration templates for fuzzing campaigns, kernel targets, and repro runs.
 - **`docker/`**: Self-contained Dockerfile providing the entire build, toolchain, NixOS, and QEMU execution environment.
@@ -52,8 +53,8 @@ When modifying or adding code to SyzAster, agents must adhere to the following d
 
 ### Target Kernel Versioning
 
-- **Target Version**: Asterinas `v0.18.1` (`d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`) is the sole targeted kernel release.
-- **No Branch Bifurcation**: Do not split code, configs, or patches into `main` vs `v0.18.1`. Kernel patches reside exclusively in `patch/asterinas/v0.18.1/`.
+- **Target Versions**: Asterinas `v0.18.1` (`d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`) and `v0.19.0` (`c4b7ed575b7b32773475b194d2ad41fb6d03765b`) are supported.
+- **Dedicated Patch Sets**: Kernel patches reside in `patch/asterinas/v0.18.1/` and `patch/asterinas/v0.19.0/`.
 
 ### Working Directory Uniformity
 
@@ -146,14 +147,14 @@ cargo test
 
 ### Kernel Patching & Image Generation
 
-Checkout Asterinas `v0.18.1` and apply kernel patches:
+Checkout Asterinas `v0.18.1` or `v0.19.0` and apply kernel patches:
 ```bash
-./scripts/update-kernel.sh -d /vol
+./scripts/update-kernel.sh -d /vol -v v0.19.0
 ```
 
 Generate the Asterinas NixOS disk image, SSH key, and staged `vmlinux`:
 ```bash
-./scripts/asterinas/create-image.sh -k /vol/asterinas -o ./.workdir
+./scripts/asterinas/create-image.sh --asterinas /vol/asterinas-v0.19.0 --out ./.workdir --version 0.19.0
 ```
 
 Boot the resulting VM in QEMU:
@@ -185,7 +186,7 @@ Before concluding any task or committing changes in SyzAster, verify:
 - Code changes in `scripts/` remain pure Shell without unnecessary wrapper binaries.
 - No `series` files have been introduced in `patch/`.
 - Patch commit messages are wrapped at 80 columns.
-- The target Asterinas version remains fixed to `v0.18.1`.
+- The target Asterinas versions remain fixed to `v0.18.1` and `v0.19.0`.
 - Any updated documentation avoids numbered step prefixes (`Step 1`, `1.`, `2.`) and raw directory trees.
 - Git commits follow `<module>: <concise description>` with author set to `Jiaming Zhang <772577952@qq.com>`.
 - Commit message title and body lines never exceed 80 characters (and total message under 80 lines).

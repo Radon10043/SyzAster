@@ -2,7 +2,7 @@
 
 **SyzAster** is an end-to-end coverage-guided kernel fuzzing prototype tool designed for the [Asterinas](https://github.com/asterinas/asterinas) Rust framekernel, built on top of [syzkaller](https://github.com/google/syzkaller) and a suite of purpose-built Rust verification, compiler-instrumentation, and evaluation tools.
 
-This document explains how to set up, build, and use **SyzAster** to fuzz the Asterinas kernel (`v0.18.1`). Detailed documentation is also available for specific topics:
+This document explains how to set up, build, and use **SyzAster** to fuzz the Asterinas kernel (`v0.18.1` and `v0.19.0`). Detailed documentation is also available for specific topics:
 - [Asterinas Kernel & NixOS VM Setup](docs/asterinas.md)
 - [Framekernel-Aware KCOV Architecture & Verification](docs/kcov.md)
 - [Subsystem-Targeted Fuzzing & Ablation](docs/subsystem.md)
@@ -23,7 +23,7 @@ Asterinas adopts a **framekernel** architecture that divides the operating syste
 - **Framekernel-Selective KCOV Instrumentation (`bin/kcov-rustc`, `bin/check-kcov-inst`)**:
   - Uses a Rust compiler wrapper (`kcov-rustc`) to selectively inject LLVM SanitizerCoverage (`-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc`) **only** when compiling the safe OS services crate (`--crate-name aster_core`) for `x86_64-unknown-none`.
   - Keeps the low-level framekernel runtime (`ostd`), page table manager, interrupt handlers, spinlocks, and the KCOV ring-buffer recorder itself uninstrumented, and disables cross-crate LTO (`CARGO_PROFILE_DEV_LTO=false`, `CARGO_PROFILE_RELEASE_LTO=false`) so LLVM cannot inline instrumented callbacks across the TCB boundary.
-- **Task-Scoped `/dev/kcov` & `/proc/kallsyms` (`patch/asterinas/v0.18.1/`)**:
+- **Task-Scoped `/dev/kcov` & `/proc/kallsyms` (`patch/asterinas/v0.18.1/`, `patch/asterinas/v0.19.0/`)**:
   - Implements a naked `__sanitizer_cov_trace_pc` trampoline and non-reentrant `record_pc` runtime in `ostd::kcov` that records caller return addresses only in task context (`InterruptLevel::current().is_task_context()`) using `try_lock()` and shared anonymous `Vmo` pages.
   - Exposes a Linux-compatible `/dev/kcov` character device (`KCOV_INIT_TRACE`, `KCOV_ENABLE`, `KCOV_DISABLE`, `mmap`) in `aster_core` and `/proc/kallsyms` (`_stext`, `_etext`) for `syz-manager` symbolization.
 - **Syzkaller Adaptations for Asterinas (`patch/syzkaller/`)**:
@@ -100,7 +100,7 @@ This example runs the Rust unit and integration tests covering the ELF parser, t
 This example verifies the patched kernel end to end: real kernel PCs are recorded through `/dev/kcov` with Linux-compatible semantics.
 
 - **Entry**: `bin/check-asterinas-kcov` (source: `src/pkg/kcov.rs`; guest test program: `tools/kcov-smoke.c` added by the Asterinas patch).
-- **Input**: a patched Asterinas source tree (`$ASTERINAS`), an image built with `create-image.sh` (`$IMAGE`), and the SSH port of the booted VM. Prepare them as described in [Prepare and Patch Asterinas Kernel](#prepare-and-patch-asterinas-kernel-v0181) and [Build the Asterinas NixOS Image](#build-the-asterinas-nixos-image).
+- **Input**: a patched Asterinas source tree (`$ASTERINAS`), an image built with `create-image.sh` (`$IMAGE`), and the SSH port of the booted VM. Prepare them as described in [Prepare and Patch Asterinas Kernel](#prepare-and-patch-asterinas-kernel) and [Build the Asterinas NixOS Image](#build-the-asterinas-nixos-image).
 - **Command**:
   ```bash
   ./scripts/asterinas/qemu.sh -i $IMAGE/asterinas.img -p 10022 &
@@ -116,7 +116,7 @@ This example verifies the patched kernel end to end: real kernel PCs are recorde
 
 ## Build and Run SyzAster
 
-This section walks through building SyzAster, patching Asterinas `v0.18.1`, building the NixOS VM image, verifying KCOV instrumentation, and launching coverage-guided fuzzing.
+This section walks through building SyzAster, patching Asterinas (`v0.18.1` / `v0.19.0`), building the NixOS VM image, verifying KCOV instrumentation, and launching coverage-guided fuzzing.
 
 ### Download SyzAster
 
@@ -146,16 +146,26 @@ make syzkaller
 > [!TIP]
 > You can also apply or revert the `syzkaller` patch series independently at any time via `make patch-syzkaller` and `make unpatch-syzkaller`.
 
-### Prepare and Patch Asterinas Kernel (`v0.18.1`)
+### Prepare and Patch Asterinas Kernel
 
-Use `scripts/update-kernel.sh` to clone Asterinas, check out `v0.18.1` (`d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`), and apply `patch/asterinas/v0.18.1/*.patch`:
+Use `scripts/update-kernel.sh` to clone Asterinas, check out the target version (`v0.19.0` or `v0.18.1`), and apply the corresponding SyzAster patches:
 ```bash
+# For Asterinas v0.19.0:
+export ASTERINAS=/vol/asterinas-v0.19.0
+$SYZASTER/scripts/update-kernel.sh -d /vol -v v0.19.0
+
+# Or for Asterinas v0.18.1:
 export ASTERINAS=/vol/asterinas-v0.18.1
-$SYZASTER/scripts/update-kernel.sh -d /vol
+$SYZASTER/scripts/update-kernel.sh -d /vol -v v0.18.1
 ```
 
 Or apply the patches manually to an existing Asterinas checkout:
 ```bash
+# For Asterinas v0.19.0 (commit c4b7ed575b7b32773475b194d2ad41fb6d03765b):
+git -C $ASTERINAS checkout --detach c4b7ed575b7b32773475b194d2ad41fb6d03765b
+git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.19.0/*.patch
+
+# For Asterinas v0.18.1 (commit d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5):
 git -C $ASTERINAS checkout --detach d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5
 git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.18.1/*.patch
 ```
@@ -169,11 +179,11 @@ $SYZASTER/bin/check-kcov-inst --asterinas $ASTERINAS
 
 Use `scripts/asterinas/create-image.sh` to compile the KCOV-instrumented Asterinas kernel (`KCOV=1`), build the NixOS disk image with Dropbear SSH and stage-2 init, and stage the unstripped `vmlinux` ELF (`target/x86_64-unknown-none/debug/asterinas-osdk-bin`):
 ```bash
-export IMAGE=/vol/images/asterinas-v0.18.1
+export IMAGE=/vol/images/asterinas-v0.19.0
 $SYZASTER/scripts/asterinas/create-image.sh \
     --asterinas $ASTERINAS \
     --out $IMAGE \
-    --version 0.18.1
+    --version 0.19.0
 ```
 
 The script produces:

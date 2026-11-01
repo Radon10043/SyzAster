@@ -4,15 +4,20 @@ This guide explains how **SyzAster** runs coverage-guided `syzkaller` against As
 
 ## Requirements
 
-- Asterinas `v0.18.1` release source (commit `d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`).
+- Asterinas release source: `v0.19.0` (commit `c4b7ed575b7b32773475b194d2ad41fb6d03765b`) or `v0.18.1` (commit `d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`).
 - Asterinas build prerequisites: Nix (`nix-build`, `nixos-install`), QEMU (`qemu-system-x86_64`), OVMF (`/usr/share/qemu/OVMF.fd`), OpenSSL, and `VDSO_LIBRARY_DIR` containing `vdso_x86_64.so` (all pre-installed in `docker/Dockerfile`).
 - Rust toolchain `nightly-2026-07-21` with `rust-src`, `rustc-dev`, `llvm-tools-preview`, and `x86_64-unknown-none`.
-- SyzAster patch series applied to both `asterinas` (`patch/asterinas/v0.18.1/`) and `syzkaller` (`patch/syzkaller/`).
+- SyzAster patch series applied to `asterinas` (`patch/asterinas/v0.19.0/` or `patch/asterinas/v0.18.1/`) and `syzkaller` (`patch/syzkaller/`).
 
 ## Patch Asterinas and Syzkaller
 
 Apply the Asterinas compatibility and KCOV patch series:
 ```bash
+# For Asterinas v0.19.0:
+git -C $ASTERINAS switch --detach v0.19.0
+git -C $ASTERINAS am $SYZASTER/patch/asterinas/v0.19.0/*.patch
+
+# Or for Asterinas v0.18.1:
 git -C $ASTERINAS switch --detach v0.18.1
 git -C $ASTERINAS am $SYZASTER/patch/asterinas/v0.18.1/*.patch
 ```
