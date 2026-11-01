@@ -31,7 +31,7 @@ Options:
   --disk-size-mb MB            Asterinas NixOS disk size (default: ${DISK_SIZE_MB}).
   --no-cover                   Build an uninstrumented image (KCOV=0) without staging vmlinux.
   --force                      Recreate the Asterinas target/nixos image.
-  --allow-version-mismatch     Build even if VERSION or the v0.18.1 release commit differs.
+  --allow-version-mismatch     Build even if VERSION or the release commit differs.
   --keep-nix-config            Keep the generated NixOS config in the Asterinas tree.
   -h, --help                   Show this help.
 
@@ -162,14 +162,24 @@ if [[ "${actual_version}" != "${ASTERINAS_VERSION}" ]]; then
 	echo "warning: ${msg}" >&2
 fi
 
-if [[ "${ASTERINAS_VERSION}" == "0.18.1" && "${ALLOW_VERSION_MISMATCH}" -eq 0 ]]; then
+if [[ "${ALLOW_VERSION_MISMATCH}" -eq 0 ]]; then
 	require_cmd git
-	release_commit=d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5
-	source_root=$(git -C "${ASTERINAS_DIR}" rev-parse --show-toplevel 2>/dev/null || true)
-	source_commit=$(git -C "${ASTERINAS_DIR}" rev-parse HEAD 2>/dev/null || true)
-	if [[ "${source_root}" != "${ASTERINAS_DIR}" || "${source_commit}" != "${release_commit}" ]]; then
-		echo "Asterinas v0.18.1 requires release commit ${release_commit}; got ${source_commit:-unverified}. Use --allow-version-mismatch only for bring-up experiments." >&2
-		exit 1
+	release_commit=""
+	case "${ASTERINAS_VERSION}" in
+	"0.18.1")
+		release_commit="d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5"
+		;;
+	"0.19.0")
+		release_commit="c4b7ed575b7b32773475b194d2ad41fb6d03765b"
+		;;
+	esac
+	if [[ -n "${release_commit}" ]]; then
+		source_root=$(git -C "${ASTERINAS_DIR}" rev-parse --show-toplevel 2>/dev/null || true)
+		source_commit=$(git -C "${ASTERINAS_DIR}" rev-parse HEAD 2>/dev/null || true)
+		if [[ "${source_root}" != "${ASTERINAS_DIR}" || "${source_commit}" != "${release_commit}" ]]; then
+			echo "Asterinas v${ASTERINAS_VERSION} requires release commit ${release_commit}; got ${source_commit:-unverified}. Use --allow-version-mismatch only for bring-up experiments." >&2
+			exit 1
+		fi
 	fi
 fi
 
@@ -197,7 +207,7 @@ stage_kernel() {
 	local symbols
 	if ! symbols=$(readelf -sW "${KERNEL_ELF}") ||
 		! awk '$7 != "UND" && $8 == "__sanitizer_cov_trace_pc" { found = 1 } END { exit !found }' <<<"${symbols}"; then
-		echo "coverage requires a kernel ELF defining __sanitizer_cov_trace_pc: ${KERNEL_ELF}. Apply patch/asterinas/v0.18.1/*.patch and build with KCOV=1." >&2
+		echo "coverage requires a kernel ELF defining __sanitizer_cov_trace_pc: ${KERNEL_ELF}. Apply patch/asterinas/v${ASTERINAS_VERSION}/*.patch and build with KCOV=1." >&2
 		exit 1
 	fi
 	mkdir -p "${STAGED_KERNEL_OBJ}"

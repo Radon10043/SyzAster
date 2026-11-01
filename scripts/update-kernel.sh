@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 
-# Clone or checkout the target Asterinas v0.18.1 source tree and apply SyzAster patches.
+# Clone or checkout target Asterinas source tree and apply SyzAster patches.
 #
 # usage:
-#   ./scripts/update-kernel.sh -d <KERNEL_DIR>
+#   ./scripts/update-kernel.sh -d <KERNEL_DIR> [-v <VERSION>]
 
 set -euo pipefail
 
 SYZASTER=$(realpath "$(dirname "$0")/..")
 ASTERINAS_REPO_URL="https://github.com/asterinas/asterinas.git"
 ASTERINAS_VERSION="v0.18.1"
-ASTERINAS_COMMIT="d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5"
+ASTERINAS_COMMIT=""
 
 KERNDIR=
 APPLY_PATCHES=1
@@ -18,9 +18,11 @@ APPLY_PATCHES=1
 print_help() {
     echo "usage: $0 [ARGS]"
     echo "  args (required):"
-    echo "    -d, --dir <DIR>         path to the directory to store Asterinas kernel source"
+    echo "    -d, --dir <DIR>         path to directory storing Asterinas source"
     echo "  args (optional):"
-    echo "    --no-patch              do not apply SyzAster compatibility and KCOV patches"
+    echo "    -v, --version <VER>     Asterinas version (v0.18.1 or v0.19.0;"
+    echo "                            default: v0.18.1)"
+    echo "    --no-patch              do not apply SyzAster KCOV patches"
     echo "    -h, --help              print help message"
 }
 
@@ -37,6 +39,15 @@ while [[ $# -gt 0 ]]; do
             exit 1
         fi
         KERNDIR=$(realpath "$2")
+        shift 2
+        ;;
+    -v | --version)
+        if [[ $# -lt 2 || -z "$2" ]]; then
+            echo "Error: Missing version for '$1'."
+            print_help
+            exit 1
+        fi
+        ASTERINAS_VERSION="$2"
         shift 2
         ;;
     --no-patch)
@@ -58,6 +69,24 @@ if [[ -z "$KERNDIR" ]]; then
     print_help
     exit 1
 fi
+
+if [[ "$ASTERINAS_VERSION" != v* ]]; then
+    ASTERINAS_VERSION="v$ASTERINAS_VERSION"
+fi
+
+case "$ASTERINAS_VERSION" in
+    v0.18.1)
+        ASTERINAS_COMMIT="d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5"
+        ;;
+    v0.19.0)
+        ASTERINAS_COMMIT="c4b7ed575b7b32773475b194d2ad41fb6d03765b"
+        ;;
+    *)
+        echo "Error: Unsupported Asterinas version '$ASTERINAS_VERSION'."
+        echo "Supported versions: v0.18.1, v0.19.0"
+        exit 1
+        ;;
+esac
 
 DEST="$KERNDIR/asterinas-$ASTERINAS_VERSION"
 if [[ ! -d "$DEST" ]]; then
