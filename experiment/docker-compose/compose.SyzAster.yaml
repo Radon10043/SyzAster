@@ -12,7 +12,7 @@ x-base: &base
     TMPDIR: /tmp
     VMCOUNT: ${EXPERIMENT_VMCOUNT}
     SYZASTER: ${EXPERIMENT_ROOT_CONTAINER}/fuzzer/SyzAster
-    SYZKALLER: ${EXPERIMENT_ROOT_CONTAINER}/fuzzer/SyzAster/syzkaller
+    SYZKALLER: /syzkaller
     OUTROOT: ${EXPERIMENT_ROOT_CONTAINER}/experiment/SyzAster
   volumes:
     - /etc/timezone:/etc/timezone:ro
@@ -43,11 +43,12 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 24h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-kernel:
     <<: *base
@@ -62,11 +63,12 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 24h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
 ##################
 ### Subsystems ###
@@ -85,12 +87,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.19.0-net:
     <<: *base
@@ -105,12 +108,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.19.0-process:
     <<: *base
@@ -125,12 +129,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.19.0-mm:
     <<: *base
@@ -145,12 +150,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-fs:
     <<: *base
@@ -165,12 +171,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-net:
     <<: *base
@@ -185,12 +192,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-process:
     <<: *base
@@ -205,12 +213,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-mm:
     <<: *base
@@ -225,12 +234,13 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "/tmp/fuzz.cfg"
         jq -s 'add' /tmp/fuzz.cfg "$$SYZASTER/experiment/configs/$$KERNEL_NAME/$$SUBSYSTEM.cfg" > "$$WORKDIR/fuzz.cfg"
-        timeout -s KILL 6h "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        timeout -s KILL 6h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
 #########################
 ### Long-Term Fuzzing ###
@@ -249,11 +259,12 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out"
         mkdir -p "$$WORKDIR" && rm -rf "$$WORKDIR"/instance-*
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "$$WORKDIR/fuzz.cfg"
         rm -f "$$WORKDIR/bench.log"
-        "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-ltf:
     <<: *base
@@ -268,8 +279,9 @@ services:
       - bash
       - -ceu
       - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out"
         mkdir -p "$$WORKDIR" && rm -rf "$$WORKDIR"/instance-*
         perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" > "$$WORKDIR/fuzz.cfg"
         rm -f "$$WORKDIR/bench.log"
-        "$$SYZKALLER/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+        "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
