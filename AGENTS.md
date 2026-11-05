@@ -1,193 +1,161 @@
-# Agents Guidelines for SyzAster
+# AGENTS.md
 
-SyzAster is a coverage-guided kernel fuzzing prototype specifically designed for the Asterinas Rust framekernel (`v0.18.1`). It is built on top of `syzkaller` (as a Git submodule) combined with purpose-built Rust verification tools, a compiler-wrapper instrumenter, statistical evaluation engines, and lifecycle shell automation scripts. SyzAster was created for the Rust Prototype Tool Contest, adopting design patterns and organizational standards aligned with SyzPilot.
+This document defines the development, collaboration, and commit conventions for
+SyzAster, to be followed by all AI agents and developers.
 
-This document serves as the authoritative operational guide for AI agents and human contributors interacting with, maintaining, and extending the SyzAster codebase.
+---
 
-## Repository Overview
+## Git Commit & Self-Containment Principles
 
-- **`bin/`**: Destination directory for compiled release binaries (`syzaster`, `check-asterinas-kcov`, `check-kcov-inst`, `kcov-rustc`, `eval-fuzz`).
-- **`src/`**: Rust codebase providing core verification, compiler wrapping, and evaluation capabilities.
-  - **`src/bin/`**: Cargo binary entry points (`syzaster.rs`, `check-asterinas-kcov.rs`, `check-kcov-inst.rs`, `kcov-rustc.rs`, `eval-fuzz.rs`).
-  - **`src/pkg/`**: Zero-dependency library modules (`elf.rs`, `eval.rs`, `json.rs`, `kcov.rs`, `tools.rs`).
-- **`syzkaller/`**: Upstream `syzkaller` repository tracked as a Git submodule.
-- **`patch/`**: Curated patch sets for upstream components.
-  - **`patch/syzkaller/`**: Patches adapting `syzkaller` for Asterinas (`/dev/kcov` fallback, symbol resolution, panic parsing, configuration templates, adaptive snapshot restoration).
-  - **`patch/asterinas/v0.18.1/`**: Patches providing task-scoped KCOV runtime, `/dev/kcov` character device, and `/proc/kallsyms` for Asterinas `v0.18.1`.
-  - **`patch/asterinas/v0.19.0/`**: Patches providing task-scoped KCOV runtime, `/dev/kcov` character device, and `/proc/kallsyms` for Asterinas `v0.19.0`.
-- **`scripts/`**: Standalone, pure Shell scripts for kernel patching, image generation, VM launching, and crash reproduction.
-- **`configs/`**: Reusable configuration templates for fuzzing campaigns, kernel targets, and repro runs.
-- **`docker/`**: Self-contained Dockerfile providing the entire build, toolchain, NixOS, and QEMU execution environment.
-- **`experiment/`**: Benchmark harness, Docker Compose orchestration files, and experiment runbooks.
-- **`docs/`**: Deep-dive technical references (`asterinas.md`, `kcov.md`, `subsystem.md`).
-- **`tests/`**: Integration and regression tests verifying ELF metadata, KCOV instrumentation boundaries, and shell script tools.
+- **Atomic Commits (Keep Commits Small)**:
+  - Each commit should focus strictly on a single logical change (e.g., split
+    changes to Makefile, Rust tools, syzkaller patches, and shell scripts into
+    separate commits).
+  - Avoid combining unrelated modifications into a single commit.
 
-## Architectural Principles
+- **Self-Containment & Compilability**:
+  - **The repository must remain self-contained and compilable after every
+    commit**.
+  - Checking out any historical commit at any point in time must build cleanly
+    via `make` (or `make rust-tools` / `cargo build --release`) and pass
+    verification (`make test` / `cargo test`, `./bin/check-kcov-inst`) without
+    breaking existing compilation or test pipelines.
 
-### Framekernel-Aware KCOV Boundary
+- **No Push Without Explicit Consent**:
+  - Never push commits or tags to the remote repository unless explicitly
+    instructed by the user. Keep commits local.
 
-Asterinas enforces a strict framekernel architecture:
-- **`ostd` (TCB)**: Minimal, unsafe OS framework containing low-level hardware abstractions, memory managers, and interrupt handlers.
-- **`aster_core`**: Safe OS service layer implementing POSIX system calls, virtual file systems, and network abstractions.
+---
 
-Applying coverage instrumentation naively across the entire kernel causes reentrancy cycles and lock-ordering deadlocks. SyzAster enforces:
-- **Selective Instrumentation**: Only `aster_core` is instrumented via `bin/kcov-rustc` using LLVM SanitizerCoverage (`-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc`).
-- **TCB Isolation**: `ostd` must never be instrumented.
-- **LTO Prohibition**: Cross-crate Link-Time Optimization is explicitly disabled (`CARGO_PROFILE_DEV_LTO=false`, `CARGO_PROFILE_RELEASE_LTO=false`) so the compiler cannot inline instrumented code into uninstrumented TCB contexts.
+## Commit Message Conventions
 
-### Task-Scoped `/dev/kcov` & Non-Reentrant Recording
+Commit messages must strictly adhere to the following structure:
 
-- Trace collection via `ostd::kcov` is restricted to task context (`InterruptLevel::current().is_task_context()`).
-- Reentrancy guards use `try_lock()` rather than blocking locks to prevent recursive spinlock deadlocks.
-- The KCOV buffer is backed by shared anonymous memory (`Vmo`) exposed to userspace at `/dev/kcov`.
+```
+[LOC]: [BRIEF]
 
-### Syzkaller Adaptations for Asterinas
-
-- **Device Fallback**: Asterinas exposes `/dev/kcov` instead of `/sys/kernel/debug/kcov`. `syz-executor` falls back automatically when debugfs returns `ENOENT`.
-- **Symbol Resolution**: When `_stext` is omitted, the symbol backend falls back to `__stext` from `/proc/kallsyms`.
-- **Panic Parsing**: Syzkaller report parsing recognizes Asterinas panic formats (`Uncaught panic: ...`) and extracts file/line source coordinates for accurate bug deduplication.
-
-## Strict Engineering Conventions
-
-When modifying or adding code to SyzAster, agents must adhere to the following decisions established in prior development:
-
-### Target Kernel Versioning
-
-- **Target Versions**: Asterinas `v0.18.1` (`d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5`) and `v0.19.0` (`c4b7ed575b7b32773475b194d2ad41fb6d03765b`) are supported.
-- **Dedicated Patch Sets**: Kernel patches reside in `patch/asterinas/v0.18.1/` and `patch/asterinas/v0.19.0/`.
-
-### Working Directory Uniformity
-
-- **Directory Name**: Always use `.workdir` as the standard working directory across all scripts, configurations, and documentation.
-- **Forbidden Pattern**: Do not use `workdir-asterinas` or other ad-hoc names.
-
-### Patch Management Rules
-
-- **No Series Files**: Do not generate or maintain quilt/git-series `series` files. Patches rely on standard numerical prefixes (`0001-...patch`, `0002-...patch`) to define ordering.
-- **Patch Application**: Upstream patches must be applicable via `git apply patch/.../*.patch`.
-- **Commit Message Line Wrapping**: Commit messages within patch files must be wrapped at 80 characters for readability in terminal viewers.
-
-### Scripting vs. Rust Division of Responsibility
-
-- **Pure Shell for Automation**: Scripts under `scripts/` must be pure Shell scripts (Bash/POSIX). Do not create Rust wrapper binaries for trivial shell tasks, and avoid wrapping simple Rust calls in redundant shell scripts.
-- **Rust for Core Logic**: Rust is strictly reserved for tools requiring type safety, ELF inspection, complex IPC/KCOV validation, compiler wrapping, and statistical computation (`src/pkg/` and `src/bin/`).
-- **Executable Placement**: Compiled Rust tools belong in `bin/`, with their sources in `src/bin/`.
-
-### Configuration Management Rules
-
-- **No Auto-Generated Configs**: `scripts/asterinas/create-image.sh` must not automatically generate or overwrite `syz-manager` config files.
-- **Placeholder Retention**: Configuration templates in `configs/` must retain clear `__XXX__` placeholders (such as `__SYZASTER__`, `__IMAGE__`, `__ASTERINAS__`) intended for manual configuration by the user or agent.
-- **Repro Config**: Keep only `configs/repro/reprosh.cfg`; do not introduce redundant duplicate configuration files.
-
-### Dockerfile Optimization
-
-- **Cached Installation**: In `docker/Dockerfile`, basic package installations must be broken down into discrete `RUN apt-get install -y ...` layers rather than one monolithic command, ensuring network or cache recovery without rebuilding earlier layers.
-
-### Git Version Control Conventions
-
-- **Active Branch**: `main`.
-- **Commit Author**: `Jiaming Zhang <772577952@qq.com>`.
-- **Commit Message Format**: Follow SyzPilot modular semantic commit convention: `<module>: <concise description>`.
-  - Examples: `scripts: add helper scripts for Asterinas`, `patch/syzkaller: add patches for Asterinas coverage`, `configs: add fuzzing config files`.
-- **Commit Message Line & Length Limits**: Neither the subject line nor any line in the commit body may exceed 80 characters; the total commit message must not exceed 80 lines.
-- **No Push Without Explicit Consent**: Never push commits or tags to the remote repository unless explicitly instructed by the user.
-- **Modular Commits**: Separate unrelated changes into distinct, topic-focused commits.
-
-### Documentation Style Guidelines
-
-- **No Directory Structure Section**: Do not include raw ASCII directory trees in `README.md`.
-- **No Numbered Steps or Lists**: Do not use numbered lists (`1.`, `2.`) or numbered step headings (`Step 1`, `Step 2`, `## 1.`) anywhere in documentation, as they are fragile and difficult to maintain. Use unordered bullet points (`-`) and descriptive headings instead.
-- **Self-Contained README**: Ensure the root `README.md` provides all critical onboarding instructions directly, without forcing users or evaluators to traverse deep link hierarchies.
-
-## Essential Commands & Toolchains
-
-### Environment & Toolchain Prerequisites
-
-Ensure the following tools are available in your path:
-- Rust nightly toolchain (`cargo`, `rustc`, `rustfmt`)
-- Go toolchain (`go >= 1.22`)
-- GNU Make, GCC, Clang/LLVM, QEMU (`qemu-system-x86_64`)
-- Nix package manager with `nixos-install-tools`
-
-### Building SyzAster Rust Tools
-
-Compile all Rust CLI binaries and stage them into `./bin/`:
-```bash
-make rust-tools
+[DETAILS]
 ```
 
-Or run in release mode via Cargo directly:
-```bash
-cargo build --release
-```
+### LOC (Location of Changes)
+- **Root-level files**: Use the file name directly (e.g., `Makefile:`,
+  `Cargo.toml:`, `AGENTS.md:`).
+- **Subdirectory files**: Use the relative folder path (e.g., `src/bin:`,
+  `src/pkg:`, `patch/syzkaller:`, `patch/asterinas:`, `scripts:`, `configs:`,
+  `docker:`, `experiment:`).
+- **Common parent rollup**: When modifications are distributed across multiple
+  subdirectories under the same top-level directory (e.g., `src/bin` and
+  `src/pkg` all under `src/`, or `patch/syzkaller` and `patch/asterinas` all
+  under `patch/`), use their common ancestor directory as LOC (e.g., `src:` or
+  `patch:`). Never use `all:` if changes are confined within a single top-level
+  directory.
+- **Path depth limit**: Directory depth must not exceed three levels; truncate
+  at the third level if deeper (or roll up to their common parent), explaining
+  specifics in BRIEF or DETAILS.
+- **Multiple distinct locations**:
+  - One to three distinct top-level locations: Separate with commas (e.g.,
+    `Makefile, src:`, `scripts, configs:`).
+  - More than three distinct top-level locations, or repository-wide changes:
+    Use `all: [BRIEF]`.
 
-### Managing Syzkaller Submodule & Patches
+### BRIEF (Summary)
+- Succinctly summarize the core change of the commit.
+- **Line length limit**: The entire first line (`[LOC]: [BRIEF]`) **must not
+  exceed 80 columns**.
 
-Apply Asterinas-specific patches to `syzkaller`:
-```bash
-make patch-syzkaller
-```
+### DETAILS (Detailed Description)
+- Leave one empty line after BRIEF, then provide a detailed list of changes,
+  reasons, and implementation details.
+- **Line length limit**: **Every line in DETAILS must not exceed 80 columns**;
+  wrap lines manually when necessary.
+- **Total length limit**: The total commit message must not exceed 80 lines.
 
-Build syzkaller binaries (`syz-manager`, `syz-executor`, `syz-fuzzer`, etc.):
-```bash
-make syzkaller
-```
+---
 
-Revert all applied patches and clean the `syzkaller` submodule:
-```bash
-make unpatch-syzkaller
-```
+## Technology Stack & Environment Constraints
 
-### Running Test Suites
+- **Rust Toolchain & Build**: Rust codebase under `src/` (Rust 2021 edition,
+  zero external crate dependencies in `Cargo.toml`, relying solely on `std`).
+  Compiled binaries belong in `bin/` (e.g., `syzaster`, `check-kcov-inst`). Must
+  build cleanly via `make` or `cargo build --release` and pass `make test`
+  (`cargo test`).
+- **Go Toolchain & Syzkaller Submodule**: Upstream `syzkaller` is tracked as a
+  Git submodule in `syzkaller/`. Built via `make syzkaller` (requires Go and GNU
+  Make). Never commit modified files directly inside the `syzkaller/` submodule
+  directory.
+- **Submodule & Patch Lifecycle**: Syzkaller adaptations reside in
+  `patch/syzkaller/`, applied via `make patch-syzkaller` and reverted via
+  `make unpatch-syzkaller`. Asterinas kernel patches reside in
+  `patch/asterinas/<version>/`. Patches must follow numerical prefixes
+  (`0001-...patch`, `0002-...patch`) without `series` files and must apply
+  cleanly via `git apply`. Patch commit messages must wrap at 80 columns.
+- **Framekernel KCOV Architecture & Boundary**: Asterinas divides the OS into a
+  minimal, unsafe TCB (`ostd`) and a safe OS services layer (`aster_core`).
+  Coverage instrumentation boundary strictly coincides with the TCB boundary:
+  - Only `aster_core` is instrumented via `bin/kcov-rustc` using LLVM
+    SanitizerCoverage (`-C passes=sancov-module` and trace-pc level 3) for
+    target `x86_64-unknown-none`.
+  - `ostd` must never be instrumented.
+  - Cross-crate LTO is explicitly forbidden (`CARGO_PROFILE_DEV_LTO=false`,
+    `CARGO_PROFILE_RELEASE_LTO=false`) to prevent compiler inlining across the
+    TCB boundary.
+  - Trace collection in `ostd::kcov` is restricted to task context
+    (`InterruptLevel::current().is_task_context()`) with non-reentrant
+    recording via `try_lock()`.
+  - Kernel symbols are exposed via `/proc/kallsyms` (`_stext`, `__stext`,
+    `_etext`) for `syz-manager` symbolization.
+- **Logic Division & Scripting Standards**:
+  - Scripts under `scripts/` must remain pure Shell (Bash/POSIX) for host
+    automation, image creation, VM launching, and crash reproduction. Do not
+    create Rust wrapper binaries for trivial shell tasks, nor shell wrappers
+    around existing CLI tools.
+  - Rust under `src/` is strictly reserved for type-safe logic, ELF inspection,
+    KCOV validation, compiler wrapping, and statistical evaluation.
+- **Configuration & Workspace Management**:
+  - Configuration templates in `configs/` must retain clear `__XXX__`
+    placeholders (e.g., `__SYZASTER__`, `__IMAGE__`, `__ASTERINAS__`); scripts
+    must never auto-generate or overwrite `syz-manager` configs.
+  - Always use `.workdir` as the standard working directory across scripts,
+    configs, and documentation. Never use ad-hoc names.
+  - Keep only `configs/repro/reprosh.cfg`; avoid duplicate configurations.
+- **Docker Environment & Optimization**: Self-contained container environment
+  in `docker/Dockerfile` provides Rust nightly, Go, LLVM, NixOS install tools,
+  and QEMU. Package installations must be broken down into discrete
+  `RUN apt-get install -y ...` layers rather than monolithic commands to
+  maximize layer caching.
 
-Execute unit and integration tests across ELF parsers, KCOV validators, and shell scripts:
-```bash
-cargo test
-```
+---
 
-### Kernel Patching & Image Generation
+## Verification Workflow & Quality Standards
 
-Checkout Asterinas `v0.18.1` or `v0.19.0` and apply kernel patches:
-```bash
-./scripts/update-kernel.sh -d /vol -v v0.19.0
-```
+- **Build & Test Verification**:
+  - Compile Rust tools: `make` (or `make rust-tools`).
+  - Run regression tests: `make test` (or `cargo test`).
+  - Validate KCOV instrumentation boundary: `./bin/check-kcov-inst`.
+- **Syzkaller & Asterinas Patch Validation**:
+  - Syzkaller patch verification:
+    `make unpatch-syzkaller && make patch-syzkaller`.
+  - Asterinas kernel update & image verification: `./scripts/update-kernel.sh`
+    and `./scripts/asterinas/create-image.sh`.
+- **Documentation Conventions**:
+  - Avoid numbered step prefixes or numbered headings in documentation; use
+    descriptive headings and bullet points instead.
+  - Do not include raw ASCII directory trees in documentation.
+  - Ensure documentation is self-contained.
 
-Generate the Asterinas NixOS disk image, SSH key, and staged `vmlinux`:
-```bash
-./scripts/asterinas/create-image.sh --asterinas /vol/asterinas-v0.19.0 --out ./.workdir --version 0.19.0
-```
-
-Boot the resulting VM in QEMU:
-```bash
-./scripts/asterinas/qemu.sh -i ./.workdir/asterinas.img -p 10022
-```
-
-### Crash Triage & Statistical Evaluation
-
-Summarize fuzzing crash reports into a CSV spreadsheet:
-```bash
-./scripts/csum.sh -d ./.workdir/crashes -o ./.workdir/crashes.csv
-```
-
-Extract crash logs matching specific bug titles:
-```bash
-./scripts/logs.sh -d ./.workdir/crashes -i interest.txt
-```
-
-Run statistical comparisons across fuzzing campaigns (calculating median coverage, $\hat{A}_{12}$ effect size, and $p$-values):
-```bash
-./bin/eval-fuzz --expdir /vol/experiment --master SyzAster --format markdown
-```
+---
 
 ## Agent Checklist Before Submitting Changes
 
 Before concluding any task or committing changes in SyzAster, verify:
-- All Rust tests pass cleanly (`cargo test`).
-- Code changes in `scripts/` remain pure Shell without unnecessary wrapper binaries.
+- Rust codebase compiles cleanly (`make`) and passes tests (`make test`).
+- KCOV instrumentation boundary check passes (`./bin/check-kcov-inst`).
+- Scripts in `scripts/` remain pure Shell without unnecessary wrapper binaries.
 - No `series` files have been introduced in `patch/`.
 - Patch commit messages are wrapped at 80 columns.
-- The target Asterinas versions remain fixed to `v0.18.1` and `v0.19.0`.
-- Any updated documentation avoids numbered step prefixes (`Step 1`, `1.`, `2.`) and raw directory trees.
-- Git commits follow `<module>: <concise description>` with author set to `Jiaming Zhang <772577952@qq.com>`.
-- Commit message title and body lines never exceed 80 characters (and total message under 80 lines).
-- Commits are kept locally and never pushed to remote without explicit user instructions.
+- Configuration templates retain `__XXX__` placeholders.
+- Patches apply cleanly to their corresponding kernel target versions.
+- Documentation follows formatting rules (no numbered steps, no ASCII trees).
+- Commit messages strictly adhere to the `[LOC]: [BRIEF]` convention.
+- Subject line and all body lines in commit messages never exceed 80 columns.
+- Commits are kept locally; never push without explicit user consent.
