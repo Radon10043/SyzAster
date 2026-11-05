@@ -13,13 +13,12 @@ clear_child_tid.
  .../templates/aster-nixos-install             | 41 +++++++++++++-
  .../templates/aster_configuration.nix         |  1 +
  distro/etc_nixos/modules/core.nix             | 19 ++++++-
- distro/etc_nixos/overlays/systemd/default.nix |  6 +++
  kernel/core/src/syscall/ptrace.rs             |  7 ++-
  kernel/core/src/syscall/set_tid_address.rs    |  9 +---
  .../process/ptrace/traceme_no_cap.c           | 53 +++++++++++++++++++
  .../src/regression/process/run_test.sh        |  3 ++
  .../src/regression/process/set_tid_address.c  | 22 ++++++++
- 10 files changed, 149 insertions(+), 13 deletions(-)
+ 9 files changed, 143 insertions(+), 13 deletions(-)
  create mode 100644 test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
  create mode 100644 test/initramfs/src/regression/process/set_tid_address.c
 
@@ -154,21 +153,6 @@ index 8d6b239c4..3bc69f7bd 100644
    '';
  
    initramfs = pkgs.makeInitrd {
-diff --git a/distro/etc_nixos/overlays/systemd/default.nix b/distro/etc_nixos/overlays/systemd/default.nix
-index 283e552f1..c1dc3f926 100644
---- a/distro/etc_nixos/overlays/systemd/default.nix
-+++ b/distro/etc_nixos/overlays/systemd/default.nix
-@@ -87,4 +87,10 @@ final: prev: {
- 
-     '';
-   });
-+
-+  # When aster_nixos.disable-systemd is enabled, the NixOS system builder still
-+  # evaluates pkgs.systemd for user units, path units, and basic tools. Pointing
-+  # systemd directly at aster_systemd avoids building unpatched upstream systemd.
-+  systemd = final.aster_systemd;
-+  systemdMinimal = final.aster_systemd;
- }
 diff --git a/kernel/core/src/syscall/ptrace.rs b/kernel/core/src/syscall/ptrace.rs
 index 65562b43b..d9ae50f4b 100644
 --- a/kernel/core/src/syscall/ptrace.rs
