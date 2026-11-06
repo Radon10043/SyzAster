@@ -521,7 +521,7 @@ index 85b0adc5d..85f4882fa 100644
  
                  let is_writable_tracked = if let Some(path) = path
 diff --git a/osdk/src/base_crate/mod.rs b/osdk/src/base_crate/mod.rs
-index c04367e2c..41d6ecd18 100644
+index 4f2228d53..f529274c5 100644
 --- a/osdk/src/base_crate/mod.rs
 +++ b/osdk/src/base_crate/mod.rs
 @@ -96,8 +96,15 @@ pub fn new_base_crate(

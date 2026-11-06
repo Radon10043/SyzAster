@@ -9,19 +9,34 @@ allow ttyS0 serial console, fix PTRACE_TRACEME parent lock ordering
 deadlock under Yama, and fix sys_set_tid_address panic when replacing
 clear_child_tid.
 ---
+ Cargo.toml                                    |  2 +-
  distro/aster_nixos_installer/default.nix      |  1 +
  .../templates/aster-nixos-install             | 41 +++++++++++++-
  .../templates/aster_configuration.nix         |  1 +
  distro/etc_nixos/modules/core.nix             | 19 ++++++-
  kernel/core/src/syscall/ptrace.rs             |  7 ++-
  kernel/core/src/syscall/set_tid_address.rs    |  9 +---
+ osdk/src/base_crate/mod.rs                    |  5 ++
  .../process/ptrace/traceme_no_cap.c           | 53 +++++++++++++++++++
  .../src/regression/process/run_test.sh        |  3 ++
  .../src/regression/process/set_tid_address.c  | 22 ++++++++
- 9 files changed, 143 insertions(+), 13 deletions(-)
+ 11 files changed, 149 insertions(+), 14 deletions(-)
  create mode 100644 test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
  create mode 100644 test/initramfs/src/regression/process/set_tid_address.c
 
+diff --git a/Cargo.toml b/Cargo.toml
+index 034636c01..8feb91d6a 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -287,7 +287,7 @@ rand = { version = "0.9.2", default-features = false }
+ riscv = { version = "0.15.0", features = ["s-mode"] }
+ spin = "0.9.4"
+ tdx-guest = "0.5.0"
+-unwinding = { version = "0.2.10", default-features = false, features = ["hide-trace", "panic", "personality", "unwinder"] }
++unwinding = { version = "=0.2.10", default-features = false, features = ["hide-trace", "panic", "personality", "unwinder"] }
+ x86_64 = "0.15.5"
+ xmas-elf = "0.10.0"
+ # Note: when updating the zerocopy version,
 diff --git a/distro/aster_nixos_installer/default.nix b/distro/aster_nixos_installer/default.nix
 index d4fa82bfb..37a78a006 100644
 --- a/distro/aster_nixos_installer/default.nix
@@ -191,6 +206,22 @@ index 92274e5b0..8c16c9965 100644
  
      let tid = ctx.posix_thread.tid();
      Ok(SyscallReturn::Return(tid as _))
+diff --git a/osdk/src/base_crate/mod.rs b/osdk/src/base_crate/mod.rs
+index 69cc44c22..286945097 100644
+--- a/osdk/src/base_crate/mod.rs
++++ b/osdk/src/base_crate/mod.rs
+@@ -321,6 +321,11 @@ fn copy_profile_configurations(workspace_root: impl AsRef<Path>) {
+ 
+     let content = toml::to_string(&manifest).unwrap();
+     fs::write(manifest_path, content).unwrap();
++
++    let target_lock_path = workspace_root.as_ref().join("Cargo.lock");
++    if target_lock_path.is_file() {
++        fs::copy(target_lock_path, "Cargo.lock").unwrap();
++    }
+ }
+ 
+ fn add_feature_entries(
 diff --git a/test/initramfs/src/regression/process/ptrace/traceme_no_cap.c b/test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
 new file mode 100644
 index 000000000..f45307c7c
