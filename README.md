@@ -220,7 +220,7 @@ cat <<__EOF__ > .workdir/fuzz.cfg
 	},
 	"reproduce": false,
 	"snapshot": false,
-	"procs": 2,
+	"procs": 8,
 	"disable_syscalls": [
 		"add_key",
 		"bpf",
