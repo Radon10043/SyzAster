@@ -274,13 +274,32 @@ jq -s 'add' ./.workdir/fuzz.cfg configs/fuzz/asterinas/fs.cfg > ./.workdir/fs-fu
 
 See [docs/subsystem.md](docs/subsystem.md) for the complete list of targeted syscall families.
 
+## Terminal UI
+
+`syzaster tui` wraps the workflow above in a keyboard-driven terminal interface. It needs no extra dependencies and runs in any truecolor terminal of at least 80x24; icons render best with a [Nerd Font](https://www.nerdfonts.com/) (pass `--no-icons` for ASCII fallbacks):
+```bash
+./bin/syzaster tui
+# Open the Monitor tab directly on a syz-manager workdir:
+./bin/syzaster tui --monitor ./.workdir
+```
+
+Press `1`, `2` and `3` to switch between the tabs and `q` to quit. The bar at the bottom always lists the keys that apply to the focused element. Paths open an input box on `Enter` (with `Tab` path completion) while the rest of the screen is dimmed, `Space` flips toggles, `←`/`→` cycle choices and `Tab` moves the focus between panels.
+
+- **Kernel Config**: Selects the Asterinas version, the download directory, patching, the build config (`configs/kernel/asterinas-<version>.toml`, previewed with syntax highlighting and opened in vim with `e`) and the image output directory. Its actions run `scripts/update-kernel.sh`, `bin/check-kcov-inst` and `scripts/asterinas/create-image.sh` in a log window over the dimmed UI that streams their output and ends with a success or failure badge (`x` cancels a running step), and a status panel shows the checked-out commit, the patch state and the image artifacts.
+- **Fuzzer Config**: Manages the `syz-manager` config (default `.workdir/fuzz.cfg`). It can generate the config from a template in `configs/fuzz/asterinas/` (optionally merged with a subsystem profile), open it in vim with `Enter` or `e`, and flip options with `Space`: coverage tracing (`cover`), QEMU crash snapshots (`experimental.crash_snapshot`), adaptive snapshot restoration (`experimental.adaptive_restart`) and crash reproduction, plus VM count, CPUs and memory. Executor processes per VM (`procs`, 1 to 32, default 8) are typed in as well and also apply to newly generated configs. Option changes are written in place without reformatting the file; templates under `configs/` are never modified. The tab also validates the config, runs the smoke test, and launches `syz-manager` in the background, always with `-bench <workdir>/bench.log` so that the Monitor tab has statistics to chart, and with output in `<workdir>/fuzz.log`.
+- **Monitor**: Picks a `syz-manager` workdir, either from the campaigns discovered under `.workdir/` and `/vol` or through the directory browser, and then shows three sub-tabs. `Fuzzing` charts coverage, crashes, crash types, executions per second and corpus size over the last 5m, 10m, 30m, 1h, 6h, 12h, 24h or the whole campaign (`←`/`→`) next to the live `fuzz.log`. `Metrics` draws every statistic recorded in `bench.log` as a line chart (`Enter` zooms, `/` filters). `Issues` lists every crash type in `crashes/` with the number of saved crash logs, the reproducer state, the first and last occurrence, and a report preview (`Enter` opens the full report).
+
+`x` in the Monitor tab stops the monitored campaign: it sends `SIGINT` so that `syz-manager` shuts down gracefully, and offers `SIGKILL` if the process is still alive afterwards. Stopping requires the `syz-manager` process to be visible in the current PID namespace. When the workdir is still being updated but no such process exists, for example because the campaign runs in another Docker Compose container, the Monitor marks it as remote and explains that it has to be stopped from the host (`docker stop <container>`).
+
+The TUI remembers its paths and choices in `.workdir/tui.conf`.
+
 ## Utility Tools
 
 ### Rust Tools (`./bin/`)
 
 All core verification, compiler-wrapping, and statistical evaluation tools are written in Rust (`src/`) and built into `./bin/` via `make`:
 
-- **`bin/syzaster`**: Unified CLI entry point dispatching to `check-kcov`, `check-inst`, `kcov-rustc`, and `eval-fuzz`:
+- **`bin/syzaster`**: Unified CLI entry point dispatching to `check-kcov`, `check-inst`, `kcov-rustc`, `eval-fuzz`, and the terminal UI (`tui`, see [Terminal UI](#terminal-ui)):
   ```bash
   ./bin/syzaster --help
   ```
