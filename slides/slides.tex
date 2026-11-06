@@ -1,0 +1,198 @@
+% SyzAster 决赛答辩幻灯片（2026 Rust 软件原型开发竞赛）
+% 编译：make（XeLaTeX，两遍）；运行效果的占位数据集中在 data/results.tex
+\documentclass[aspectratio=169,10pt,fontset=none,zihao=false]{ctexbeamer}
+
+% ---------------------------------------------------------------
+% 主题与配色：与 report/images/arch.drawio 的图例保持一致
+% ---------------------------------------------------------------
+\usetheme[progressbar=frametitle,numbering=fraction,block=fill,
+  sectionpage=progressbar]{metropolis}
+
+\definecolor{SARust}{HTML}{800000}      % SyzAster 的 Rust 组件
+\definecolor{SARustFill}{HTML}{F5E6E6}
+\definecolor{SASyz}{HTML}{1F4E79}       % syzkaller 适配组件
+\definecolor{SASyzFill}{HTML}{EAF0F7}
+\definecolor{SATcb}{HTML}{555555}       % 可信计算基（TCB）
+\definecolor{SATcbFill}{HTML}{E3E3E3}
+\definecolor{SAAccent}{HTML}{B7410E}    % 铁锈橙：强调与进度条
+\definecolor{SADark}{HTML}{23272E}      % 标题栏
+\definecolor{SAText}{HTML}{1E1E1E}
+\definecolor{SAOk}{HTML}{2E7D32}
+\definecolor{SATerm}{HTML}{1E2229}
+
+\setbeamercolor{normal text}{fg=SAText,bg=white}
+\setbeamercolor{alerted text}{fg=SAAccent}
+\setbeamercolor{example text}{fg=SASyz}
+\setbeamercolor{frametitle}{fg=white,bg=SADark}
+\setbeamercolor{progress bar}{fg=SAAccent,bg=SATcbFill}
+\setbeamercolor{title separator}{fg=SAAccent}
+\setbeamercolor{block title}{fg=SAText,bg=SATcbFill}
+\setbeamercolor{block body}{bg=SATcbFill!35}
+\setbeamercolor{palette primary}{fg=white,bg=SADark}
+\setbeamercolor{standout}{fg=white,bg=SADark}
+
+% ---------------------------------------------------------------
+% 字体：仅使用 docker/Dockerfile 已安装的 Noto Sans CJK 与 DejaVu
+% ---------------------------------------------------------------
+\setsansfont{Noto Sans CJK SC}[ItalicFont=*]
+\setmainfont{Noto Sans CJK SC}[ItalicFont=*]
+\setmonofont{DejaVu Sans Mono}[Scale=0.86]
+\setCJKmainfont{Noto Sans CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans Mono CJK SC}[Scale=0.86]
+\setbeamerfont{frametitle}{size=\large,series=\bfseries}
+\setbeamerfont{title}{size=\LARGE,series=\bfseries}
+\setbeamerfont{subtitle}{size=\normalsize}
+\setbeamerfont{section title}{size=\Large,series=\bfseries}
+\linespread{1.08}
+
+% ---------------------------------------------------------------
+% 宏包
+% ---------------------------------------------------------------
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{fontawesome5}
+\usepackage{qrcode}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage[most]{tcolorbox}
+\usetikzlibrary{arrows.meta,positioning,calc,fit,backgrounds,shapes.geometric,
+  shapes.misc,decorations.pathreplacing}
+
+\graphicspath{{images/}{../report/images/}}
+
+% ---------------------------------------------------------------
+% 快捷命令（命名沿用 report/report.tex）
+% ---------------------------------------------------------------
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\syz}{syzkaller}
+\newcommand{\aster}{Asterinas}
+\newcommand{\sa}{SyzAster}
+\newcommand{\repourl}{https://github.com/Radon10043/SyzAster}
+\newcommand{\hl}[1]{\textcolor{SAAccent}{\textbf{#1}}}
+\newcommand{\rust}[1]{\textcolor{SARust}{\textbf{#1}}}
+\newcommand{\blue}[1]{\textcolor{SASyz}{\textbf{#1}}}
+\newcommand{\muted}[1]{\textcolor{SATcb}{#1}}
+
+% 待补充数据的醒目占位标记：\TBD{提示文字}
+\newtcbox{\TBD}{on line,colback=SAAccent!10,colframe=SAAccent,colupper=SAAccent,
+  boxrule=0.5pt,arc=1.5pt,boxsep=0pt,left=2pt,right=2pt,top=1pt,bottom=1pt,
+  fontupper=\bfseries}
+
+% 较长的待补充说明（可自动换行）：\TBDlong{提示文字}
+\newcommand{\TBDlong}[1]{\textcolor{SAAccent}{\bfseries\faIcon{edit}\ #1}}
+
+% 图片存在则插入，否则画出带文件名提示的虚线占位框
+% 用法：\imageorplaceholder{images/xxx.png}{宽}{高}{说明}
+\newcommand{\imageorplaceholder}[4]{%
+  \IfFileExists{#1}{%
+    \includegraphics[width=#2,height=#3,keepaspectratio]{#1}%
+  }{%
+    \begin{tikzpicture}
+      \node[draw=SAAccent,dashed,line width=0.8pt,fill=SAAccent!5,
+        minimum width=#2,minimum height=#3,rounded corners=2pt,
+        align=center,text=SAAccent,font=\small] {%
+        \faIcon[regular]{image}\quad\textbf{#4}\\[2pt]
+        \scriptsize 截图待补充：\code{slides/#1}};
+    \end{tikzpicture}%
+  }%
+}
+
+% 卡片样式
+\tcbset{
+  sacard/.style={enhanced,arc=2pt,boxrule=0.6pt,left=4pt,right=4pt,top=3pt,
+    bottom=3pt,fonttitle=\bfseries\small,fontupper=\small,halign=flush left,
+    attach boxed title to top left={yshift=-1.2mm,xshift=2mm},
+    boxed title style={arc=1pt,boxrule=0pt,left=3pt,right=3pt,top=1pt,bottom=1pt}},
+  rustcard/.style={sacard,colback=SARustFill,colframe=SARust,
+    boxed title style={colback=SARust}},
+  syzcard/.style={sacard,colback=SASyzFill,colframe=SASyz,
+    boxed title style={colback=SASyz}},
+  tcbcard/.style={sacard,colback=SATcbFill,colframe=SATcb,
+    boxed title style={colback=SATcb}},
+  accentcard/.style={sacard,colback=SAAccent!8,colframe=SAAccent,
+    boxed title style={colback=SAAccent}},
+  terminal/.style={enhanced,colback=SATerm,colframe=SATerm,colupper=white,arc=2pt,
+    boxrule=0pt,left=5pt,right=5pt,top=4pt,bottom=4pt,
+    fontupper=\ttfamily\scriptsize},
+}
+
+% 指标卡片：\stattile{卡片样式}{数值}{说明}，用于 tcbraster 中
+\newcommand{\stattile}[3]{%
+  \begin{tcolorbox}[#1,halign=flush center,valign=center,top=2pt,bottom=2pt]
+    {\Large\bfseries #2}\\[-1pt]{\scriptsize #3}
+  \end{tcolorbox}}
+
+% TikZ 通用样式
+\tikzset{
+  >={Stealth[length=2mm]},
+  box/.style={draw,rounded corners=2pt,align=flush center,inner sep=4pt,font=\small},
+  rustbox/.style={box,draw=SARust,fill=SARustFill,line width=0.7pt},
+  syzbox/.style={box,draw=SASyz,fill=SASyzFill,line width=0.7pt},
+  tcbbox/.style={box,draw=SATcb,fill=SATcbFill,line width=0.7pt},
+  plainbox/.style={box,draw=SATcb!70,fill=white,line width=0.6pt},
+  flow/.style={->,line width=0.8pt,draw=SATcb},
+  tag/.style={circle,fill=SAAccent,text=white,font=\scriptsize\bfseries,
+    inner sep=1pt,minimum size=4.2mm},
+}
+
+% ---------------------------------------------------------------
+% 代码清单：Rust 语法 + 浅色背景
+% ---------------------------------------------------------------
+\lstdefinelanguage{Rust}{
+  keywords={as,break,const,continue,crate,else,enum,extern,false,fn,for,if,impl,
+    in,let,loop,match,mod,move,mut,pub,ref,return,self,Self,static,struct,super,
+    trait,true,type,unsafe,use,where,while,dyn,Some,None,Ok,Err},
+  sensitive=true,
+  comment=[l]{//},
+  morecomment=[s]{/*}{*/},
+  string=[b]",
+}
+\lstset{
+  language=Rust,
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{SASyz}\bfseries,
+  commentstyle=\color{SAAccent},
+  stringstyle=\color{SAOk},
+  backgroundcolor=\color{SATcbFill!40},
+  frame=l,framerule=1.5pt,rulecolor=\color{SARust},
+  xleftmargin=6pt,framexleftmargin=4pt,
+  aboveskip=2pt,belowskip=2pt,
+  columns=fullflexible,keepspaces=true,
+  showstringspaces=false,
+  extendedchars=true,
+  escapeinside={(*@}{@*)},
+}
+
+% ---------------------------------------------------------------
+% 标题信息
+% ---------------------------------------------------------------
+\title{\sa{}：面向 \aster{} 框内核的\\覆盖制导内核模糊测试}
+\subtitle{2026 Rust 软件原型开发竞赛\quad 决赛答辩}
+\author{张家铭}
+\institute{北京科技大学\quad RustTrace 队\\[2pt]
+  \scriptsize\faGithub\ \url{\repourl}}
+\date{2026 年 11 月}
+\titlegraphic{\hfill\raisebox{-5.6cm}{\qrcode[height=2.2cm]{\repourl}}}
+
+\input{data/results.tex}
+
+\begin{document}
+
+\maketitle
+
+\begin{frame}{汇报提纲}
+  \setbeamertemplate{section in toc}[sections numbered]
+  \tableofcontents
+\end{frame}
+
+\input{sections/background.tex}
+\input{sections/design.tex}
+\input{sections/innovation.tex}
+\input{sections/impl.tex}
+\input{sections/results.tex}
+\input{sections/summary.tex}
+
+\end{document}

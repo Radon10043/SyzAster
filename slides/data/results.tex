@@ -1,0 +1,51 @@
+% ===============================================================
+% 运行效果数据：所有待补充的实验结果都集中在此文件
+% ---------------------------------------------------------------
+% 填写方法：把 \TBD{...} 或 \TBDlong{...} 整体替换为真实数据，例如
+%   \newcommand{\ResDuration}{\TBD{xx 小时}}  →  \newcommand{\ResDuration}{72 小时}
+% 时间线图：在 data/timeline.csv 中按如下格式提供累计独特问题数，
+% 编译时自动绘制（文件不存在则显示占位框）：
+%   hours,issues
+%   0,0
+%   6,3
+%   ...
+% ===============================================================
+
+% 实验设置
+\newcommand{\ResKernel}{\TBD{v0.19.0}}
+\newcommand{\ResDuration}{\TBD{xx 小时}}
+\newcommand{\ResVMs}{\TBD{x 台 VM，x vCPU / x GB}}
+\newcommand{\ResProfiles}{\TBD{全内核 + 4 个子系统}}
+\newcommand{\ResTrials}{\TBD{x 次}}
+\newcommand{\ResHost}{\TBD{CPU 型号 / 核数}}
+
+% 总体发现（指标卡片）
+\newcommand{\ResUniqueIssues}{\TBD{N}}
+\newcommand{\ResPanics}{\TBD{N}}
+\newcommand{\ResHangs}{\TBD{N}}
+\newcommand{\ResReported}{\TBD{N}}
+
+% 发现的问题列表：每行依次为 编号 & 去重标题 & 类型 & 子系统 & 状态
+\newcommand{\IssueRows}{%
+  1 & \TBD{asterinas panic: <原因> at <源码路径>:LINE} & \TBD{panic} & \TBD{fs}
+    & \TBD{已上报} \\
+  2 & \TBD{asterinas panic: <原因> at <源码路径>:LINE} & \TBD{panic} & \TBD{net}
+    & \TBD{已确认} \\
+  3 & \TBD{asterinas panic: <原因> at <源码路径>:LINE} & \TBD{panic}
+    & \TBD{process} & \TBD{已修复} \\
+  4 & \TBD{<挂起 / 死锁问题标题>} & \TBD{死锁} & \TBD{mm} & \TBD{已上报} \\
+  5 & \TBD{<语义偏差问题标题>} & \TBD{语义偏差} & \TBD{fs} & \TBD{已上报} \\
+  6 & \TBD{……} & \TBD{……} & \TBD{……} & \TBD{……} \\
+}
+
+% 典型案例
+\newcommand{\CaseTitle}{\TBD{asterinas panic: <原因> at <源码路径>:LINE}}
+\newcommand{\CaseRepro}{%
+  \TBD{<syz 重现程序，例如：r0 = openat(...)>}\\[2pt]
+  \TBD{<第二个系统调用>}}
+\newcommand{\CaseLog}{%
+  \TBD{ERROR: Uncaught panic:}\\[2pt]
+  \TBD{<panic 原因>}\\[2pt]
+  \TBD{at <源码路径>:<行号>}}
+\newcommand{\CaseRootCause}{\TBDlong{根因：哪个函数在什么输入下触发 unwrap 或断言失败}}
+\newcommand{\CaseStatus}{\TBDlong{上游 issue / PR 编号及状态}}

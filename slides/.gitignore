@@ -1,0 +1,19 @@
+# LaTeX / Beamer auxiliary files
+*.aux
+*.log
+*.nav
+*.out
+*.snm
+*.toc
+*.vrb
+*.xdv
+*.run.xml
+*.synctex.gz
+*.fdb_latexmk
+*.fls
+
+# Build output
+*.pdf
+
+# Local preview renders
+.preview/

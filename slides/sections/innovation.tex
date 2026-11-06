@@ -1,0 +1,250 @@
+% ===============================================================
+% 核心创新
+% ===============================================================
+\section{核心创新}
+
+% ---------------------------------------------------------------
+\begin{frame}[fragile]{创新一：插桩边界 = TCB 边界}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.43\textwidth}
+\centering
+\begin{tikzpicture}[node distance=4mm]
+  \node[plainbox,minimum width=5cm] (cargo)
+    {\code{make KCOV=1}\quad{\scriptsize（\code{cargo osdk build}）}};
+  \node[rustbox,below=of cargo,minimum width=5cm] (wrap)
+    {\textbf{\code{kcov-rustc}}\quad{\scriptsize（\code{RUSTC\_WRAPPER}）}\\
+     \scriptsize 按 crate 名与目标平台决定是否插桩};
+  \node[rustbox,below=7mm of wrap.south west,anchor=north west,
+    minimum width=2.25cm,minimum height=1.05cm] (core)
+    {\textbf{\code{aster\_core}}\\\scriptsize + SanitizerCoverage};
+  \node[tcbbox,below=7mm of wrap.south east,anchor=north east,
+    minimum width=2.25cm,minimum height=1.05cm] (ostd)
+    {\textbf{\code{ostd}} 等\\\scriptsize 原样编译};
+  \draw[flow] (cargo) -- (wrap);
+  \draw[flow,SARust] (core.north|-wrap.south) -- (core.north);
+  \draw[flow] (ostd.north|-wrap.south) -- (ostd.north);
+  \coordinate (mid) at ($(core.east)!0.5!(ostd.west)$);
+  \draw[dashed,SAAccent,line width=1pt]
+    ([yshift=9mm]mid) -- ([yshift=-9mm]mid);
+  \node[font=\scriptsize\bfseries,text=SAAccent,below=8.5mm of mid] {TCB 边界};
+  \node[font=\scriptsize,text=SAAccent,align=center,below=16mm of mid]
+    {\faTimes\ 禁止跨 crate LTO 内联};
+\end{tikzpicture}
+
+\vspace{1mm}
+\begin{itemize}\small
+  \item OSTD 中的页表、中断、自旋锁和\textbf{覆盖记录器本身}都不插桩，
+    回调路径上不会再触发回调
+  \item \code{KCOV=1} 强制关闭 LTO，并拒绝其他编译器包装器
+\end{itemize}
+\end{column}
+\begin{column}{0.54\textwidth}
+\textbf{\small\code{kcov-rustc} 的插桩判定（\code{src/pkg/kcov.rs}）}
+\begin{lstlisting}
+let mut cmd = Command::new(rustc);
+cmd.args(rest);
+if crate_name == Some("aster_core")
+  && target == Some("x86_64-unknown-none") {
+  cmd.args(["-C", "passes=sancov-module",
+    "-C", "llvm-args=-sanitizer-coverage-level=3",
+    "-C", "llvm-args=-sanitizer-coverage-trace-pc"]);
+}
+\end{lstlisting}
+
+\vspace{2mm}
+\begin{tcolorbox}[accentcard,title={\faIcon{check-circle}\ 秒级前置校验：\code{check-kcov-inst}}]
+  把一个 \code{\#![no\_std]} 探针 crate 分别以 \code{aster\_core} 和 \code{ostd}
+  的身份编译，再用自研 ELF 解析器断言：前者\textbf{引用}
+  \code{\_\_sanitizer\_cov\_trace\_pc}，后者\textbf{不引用}。\\[2pt]
+  实测 \hl{0.13 s}，不必等待完整的内核构建
+\end{tcolorbox}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}[fragile]{创新一：无递归、无死锁的覆盖运行时（\code{ostd::kcov}）}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.56\textwidth}
+\begin{lstlisting}
+#[unsafe(naked)] #[unsafe(no_mangle)]
+extern "C" fn __sanitizer_cov_trace_pc() {
+  // 取返回地址作为 PC，尾跳转，不建栈帧
+  core::arch::naked_asm!("mov rdi, [rsp]",
+                         "jmp {}", sym record_pc);
+}
+extern "C" fn record_pc(pc: usize) {
+  if IN_BOOTSTRAP_CONTEXT.load(Relaxed)
+    || !InterruptLevel::current().is_task_context()
+  { return; }
+  let Some(task) = Task::current() else { return };
+  // 绝不自旋：嵌套调用直接丢弃
+  let Some(slot) = task.kcov.try_lock()
+    else { return };
+  if let Some(a) = slot.as_ref() { a.0.record(pc); }
+}
+\end{lstlisting}
+{\scriptsize\muted{节选自 \aster{} 补丁 0002 的 \code{ostd/src/kcov.rs}，略有简化}}
+
+\vspace{1mm}
+{\small 汇编只有\textbf{两条指令}，其余逻辑全部回到编译器可检查的安全 Rust}
+\end{column}
+\begin{column}{0.41\textwidth}
+\centering
+\begin{tikzpicture}[node distance=2mm,
+    stepbox/.style={box,minimum width=3.7cm,text width=3.5cm,font=\scriptsize,
+      inner sep=3pt},
+    drop/.style={font=\scriptsize,text=SATcb,anchor=west}]
+  \node[stepbox,tcbbox] (tramp)
+    {跳板：\code{rdi} $\leftarrow$ \code{[rsp]}};
+  \node[stepbox,tcbbox,below=of tramp] (f1) {内核仍在启动阶段？};
+  \node[stepbox,tcbbox,below=of f1] (f2) {处于中断上下文？};
+  \node[stepbox,tcbbox,below=of f2] (f3) {\code{try\_lock()} 失败（嵌套）};
+  \node[stepbox,rustbox,below=of f3] (rec) {\code{KcovBuffer::record(pc)}};
+  \foreach \a/\b in {tramp/f1,f1/f2,f2/f3,f3/rec}
+    \draw[flow] (\a) -- (\b);
+  \foreach \n in {f1,f2,f3}
+    \draw[flow,SATcb!70] (\n.east) -- ++(3mm,0) node[drop] {丢弃};
+\end{tikzpicture}
+
+\vspace{2mm}
+\begin{tcolorbox}[accentcard]
+  最坏情况只\textbf{丢一个样本}，绝不死锁；与 Linux kcov
+  “只记录任务上下文”的语义一致
+\end{tcolorbox}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}[fragile]{创新一：把共享内存当作敌意输入}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.57\textwidth}
+\textbf{\small\code{KcovBuffer::record}：首个字是用户态可改写的 PC 计数}
+\begin{lstlisting}
+fn record(&self, pc: usize) {
+  let Ok(count) = self.frames[0]            // (A)
+    .read_once::<usize>(0) else { return; };
+  if count >= self.entries - 1 { return; }  // (B)
+  let index = count + 1;
+  let frame = &self.frames[index / WORDS_PER_PAGE];
+  if frame.write_once((index % WORDS_PER_PAGE)
+      * WORD_SIZE, &pc).is_err() { return; }
+  compiler_fence(Ordering::Release);        // (C)
+  let _ = self.frames[0].write_once(0, &(count + 1));
+}
+\end{lstlisting}
+
+\vspace{1mm}
+\begin{tcolorbox}[tcbcard,title={RAII：解绑不会被遗漏}]
+  \code{Attachment(Arc<KcovBuffer>)} 的 \code{Drop} 以 \code{Release} 序清除活跃标志；
+  \code{KCOV\_DISABLE}、线程退出、异常退出都会自动解绑
+\end{tcolorbox}
+\end{column}
+\begin{column}{0.4\textwidth}
+\begin{tcolorbox}[rustcard,title={(A) 消除 TOCTOU}]
+  用户态可随时改写计数；只读取一次，检查与使用之间不会被篡改
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[rustcard,title={(B) 不可能越界写}]
+  即使计数被改成 \code{usize::MAX} 也只会放弃记录，ktest 覆盖了这一场景
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[rustcard,title={(C) 发布顺序}]
+  编译器屏障加上 x86-64 的存储有序性，用户态看到新计数时 PC 已经写入
+\end{tcolorbox}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{创新二：自适应内核生命周期管理}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.56\textwidth}
+\centering
+\begin{tikzpicture}[
+    act/.style={box,minimum width=2.9cm,text width=2.75cm,minimum height=0.95cm,
+      font=\scriptsize,inner sep=2pt}]
+  \node[act,rustbox] (cont) {\textbf{继续模糊测试}\\停机时间为 0};
+  \node[act,rustbox,below=2mm of cont] (ckpt) {\textbf{保存检查点}\\QMP \code{savevm}};
+  \node[act,syzbox,below=2mm of ckpt] (soft)
+    {\textbf{软重启}：从快照库\\\textbf{随机}选取，QMP \code{loadvm}};
+  \node[act,tcbbox,below=2mm of soft] (hard) {\textbf{硬重启}\\重建 VM 实例};
+  \node[syzbox,font=\scriptsize,text width=1.9cm,minimum height=4.4cm,
+    left=8mm of $(ckpt.west)!0.5!(soft.west)$] (ctl)
+    {\textbf{\small 自适应\\控制器}\\[4pt]每个窗口\\每台 VM\\[4pt]
+     16 维上下文 $x$\\[4pt]LinUCB\\选择动作};
+  \foreach \n in {cont,ckpt,soft,hard}
+    \draw[flow] (ctl.east|-\n.west) -- (\n.west);
+  \node[draw=SATcb,cylinder,shape border rotate=90,aspect=0.25,
+    fill=SATcbFill!60,minimum width=1.5cm,minimum height=1.3cm,align=center,
+    font=\scriptsize,right=5mm of $(ckpt.east)!0.5!(soft.east)$] (bank)
+    {快照库\\\code{delvm}\\回收};
+  \draw[flow,SASyz] (ckpt.east) -| node[pos=0.25,above,font=\tiny,text=SASyz]{存入}
+    (bank.north);
+  \draw[flow,SASyz] (bank.south) |- node[pos=0.75,below,font=\tiny,text=SASyz]{恢复}
+    (soft.east);
+\end{tikzpicture}
+\end{column}
+\begin{column}{0.41\textwidth}
+\small
+\textbf{启动后}先保存一个\textbf{干净快照}，之后由控制器逐窗口决策
+
+\vspace{2mm}
+\textbf{为什么能降低开销}
+\begin{itemize}
+  \item 软重启\textbf{不经过} NixOS 完整启动，只恢复内存与设备状态
+  \item 检查点把有价值的内核状态留在快照库中，随机恢复以保持多样性
+  \item 只有状态确实变坏时才付出硬重启的代价
+\end{itemize}
+
+\vspace{1mm}
+\textbf{工程实现}（\syz{} 补丁 0005）
+\begin{itemize}
+  \item QEMU 后端新增 QMP \code{savevm}、\code{loadvm}、\code{delvm}
+  \item 校准并\textbf{固定 TSC 频率}，快照恢复后客户机时钟保持一致
+\end{itemize}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{创新二：基于带折扣 LinUCB 的动作选择}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.5\textwidth}
+\begin{tcolorbox}[syzcard,title={上下文多臂老虎机}]
+  每个动作 $a$ 维护 $A_a \in \mathbb{R}^{16\times16}$ 与 $\mathbf{b}_a$：
+  \[
+    a^\ast = \arg\max_{a}\;
+      \underbrace{\hat{\boldsymbol\theta}_a^{\top}x}_{\text{预期收益}}
+      + \alpha\underbrace{\sqrt{x^{\top}A_a^{-1}x}}_{\text{不确定性}},
+    \quad \hat{\boldsymbol\theta}_a = A_a^{-1}\mathbf{b}_a
+  \]
+  \vspace{-4mm}
+  \begin{itemize}
+    \item \textbf{折扣}：每次观测后所有动作模型都向先验衰减，长期未选的动作不会保留过时估计
+    \item \textbf{冷启动}：每个可选动作先各采样一次
+  \end{itemize}
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[tcbcard,title={\faIcon{shield-alt}\ 安全边界}]
+  VM 最长存活时间、软重启次数上限；触发时强制硬重启，该样本\textbf{不参与}训练
+\end{tcolorbox}
+\end{column}
+\begin{column}{0.47\textwidth}
+\begin{tcolorbox}[rustcard,title={上下文 $x$（16 维，节选）}]
+  VM 运行时间 · 执行吞吐及其相对峰值的比例 · 新信号与稳定信号 · 新输入 · 软重启次数 …
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[accentcard,title={奖励（单位时间）}]
+  \textcolor{SAOk}{\faPlus}\ 新覆盖、新种子、新的独特问题\\
+  \textcolor{SAAccent}{\faMinus}\ 挂起、重复问题、动作停机时间、动作失败
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[syzcard,title={实现与测试}]
+  \code{pkg/adaptive}：控制器、LinUCB、快照库、谱系恢复；
+  29 个文件、+4216 行、\textbf{60} 个 Go 单元测试
+\end{tcolorbox}
+\end{column}
+\end{columns}
+\end{frame}

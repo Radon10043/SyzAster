@@ -1,0 +1,152 @@
+% ===============================================================
+% 项目背景
+% ===============================================================
+\section{项目背景}
+
+% ---------------------------------------------------------------
+\begin{frame}{\aster{}：Rust 编写的框内核操作系统}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.47\textwidth}
+\centering
+\begin{tikzpicture}[node distance=1.5mm,
+    layer/.style={box,minimum width=6.1cm,text width=5.8cm}]
+  \node[layer,plainbox] (user) {\textbf{用户态}：NixOS、systemd、Linux 应用};
+  \node[layer,rustbox,below=4.5mm of user,minimum height=1.25cm] (core)
+    {\textbf{\code{aster\_core}}：操作系统服务层\\
+     \footnotesize 进程 · VFS · 网络 · 内存映射 · 设备\\
+     \footnotesize\textcolor{SARust}{只允许安全 Rust}};
+  \node[layer,tcbbox,below=of core,minimum height=1.1cm] (ostd)
+    {\textbf{OSTD}：最小可信计算基（TCB）\\
+     \footnotesize 页表 · 中断 · 自旋锁 · 任务调度\\
+     \footnotesize\textcolor{SATcb}{\code{unsafe} 仅限于此}};
+  \node[layer,plainbox,below=of ostd,fill=SATcbFill!40] (hw) {硬件（x86\_64）};
+  \draw[dashed,SAAccent,line width=0.8pt]
+    ($(user.south west)!0.5!(core.north west)$) --
+    node[pos=0.5,fill=white,font=\scriptsize,text=SAAccent,inner sep=1pt]
+      {Linux 兼容 ABI（系统调用）}
+    ($(user.south east)!0.5!(core.north east)$);
+  \draw[decorate,decoration={brace,amplitude=4pt},line width=0.7pt,SATcb]
+    ([xshift=2mm]core.north east) -- ([xshift=2mm]ostd.south east)
+    node[midway,right=3pt,font=\scriptsize,align=left,text=SATcb]
+      {同一\\地址\\空间};
+\end{tikzpicture}
+
+\vspace{1mm}
+{\footnotesize OSTD 可信 $\Rightarrow$ 服务层的内存安全由编译器静态保证}
+\end{column}
+\begin{column}{0.5\textwidth}
+\textbf{\large 但\alert{内存安全 $\neq$ 系统正确}}
+
+\vspace{1.5mm}
+\begin{itemize}\small
+  \item \alert{内核 panic}：\code{unwrap()}、\code{assert!}、\code{todo!()}
+    遇到畸形参数直接触发 panic $\to$ 本地拒绝服务
+  \item \alert{死锁}：安全 Rust 消除数据竞争，但无法阻止嵌套加锁的顺序错误
+  \item \alert{语义偏差}：与 Linux/POSIX 的细微不一致会破坏 systemd 等用户态服务
+  \item \alert{跨 TCB 穿透}：异常输入经 trait 接口触发 OSTD 的非预期行为
+\end{itemize}
+
+\vspace{1mm}
+\begin{tcolorbox}[accentcard,fontupper=\small]
+  这类问题只能在运行时由\textbf{特定的系统调用序列}触发\\
+  $\Rightarrow$ 需要\textbf{系统调用级的覆盖制导模糊测试}
+\end{tcolorbox}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{\syz{}：系统调用级覆盖制导内核模糊测试}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.56\textwidth}
+\centering
+\begin{tikzpicture}[node distance=6mm]
+  \node[syzbox,minimum width=3.0cm] (mgr)
+    {\textbf{\code{syz-manager}}\\\scriptsize 语料库 · 变异 · 问题归档};
+  \node[syzbox,right=20mm of mgr,minimum width=2.6cm] (exe)
+    {\textbf{\code{syz-executor}}\\\scriptsize 执行测试程序};
+  \node[tcbbox,below=12mm of exe,minimum width=2.6cm] (kern)
+    {\textbf{Linux 内核}\\\scriptsize 编译期全局插桩};
+  \node[plainbox,minimum width=3.0cm] (crash) at (mgr|-kern)
+    {\textbf{串口日志}\\\scriptsize Oops / KASAN 报告};
+  \begin{scope}[on background layer]
+    \node[draw=SATcb!60,dashed,rounded corners=3pt,fit=(exe)(kern),
+      inner sep=6pt,label={[font=\scriptsize,text=SATcb]above:虚拟机}] (vm) {};
+  \end{scope}
+  \draw[flow] ([yshift=2mm]mgr.east) -- node[above,font=\scriptsize]{测试程序}
+    ([yshift=2mm]exe.west);
+  \draw[flow,SASyz] ([yshift=-2mm]exe.west) -- node[below,font=\scriptsize,
+    text=SASyz]{新覆盖 PC} ([yshift=-2mm]mgr.east);
+  \draw[flow] ([xshift=-5mm]exe.south) -- node[left,font=\scriptsize]{系统调用}
+    ([xshift=-5mm]kern.north);
+  \draw[flow,SASyz] ([xshift=5mm]kern.north) -- node[right,font=\scriptsize,
+    text=SASyz]{kcov}([xshift=5mm]exe.south);
+  \draw[flow] (kern) -- node[below,font=\scriptsize]{崩溃} (crash);
+  \draw[flow] (crash) -- node[right,font=\scriptsize,align=left]{解析去重\\重启 VM}
+    (mgr);
+  % 对 Linux 宏内核的假设
+  \node[tag] at (kern.south east) {1};
+  \node[tag] at (exe.north east) {2};
+  \node[tag] at (crash.south west) {3};
+  \node[tag] at (mgr.south west) {4};
+\end{tikzpicture}
+
+\vspace{2mm}
+{\footnotesize 已在 Linux、FreeBSD 等内核中发现并推动修复\textbf{数千个}真实问题（syzbot）}
+\end{column}
+\begin{column}{0.42\textwidth}
+\textbf{依赖的 Linux 宏内核假设}
+
+\vspace{1.5mm}
+\small
+\begin{tabular}{@{}c@{\hspace{2mm}}p{0.84\linewidth}@{}}
+  \tikz\node[tag]{1}; & 编译期对\textbf{整个内核}插入覆盖回调，靠手工排除列表跳过 kcov 自身 \\[1mm]
+  \tikz\node[tag]{2}; & 通过 \code{debugfs} 的 kcov 获取覆盖，借 \code{/proc/kallsyms} 符号化 \\[1mm]
+  \tikz\node[tag]{3}; & 按 Oops、KASAN 的报告格式识别崩溃并去重 \\[1mm]
+  \tikz\node[tag]{4}; & 每次崩溃后\textbf{完整重启}目标机 \\
+\end{tabular}
+
+\vspace{2mm}
+\begin{tcolorbox}[syzcard,fontupper=\small]
+  \aster{} 提供 Linux 兼容 ABI，可以直接运行 \syz{} 的测试程序，
+  但以上四条假设\alert{在框内核上都不成立}
+\end{tcolorbox}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}{把 \syz{} 移植到框内核的四大挑战}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.49\textwidth}
+\begin{tcolorbox}[rustcard,title={\faIcon{sync-alt}\ 挑战一：插桩与运行时互相干扰}]
+  全内核注入 SanitizerCoverage 后，回调依赖的任务查询、自旋锁也被插桩
+  $\to$ \alert{无限递归}；中断上下文的探针与持锁任务争用 $\to$ \alert{死锁}；
+  跨 crate LTO 使插桩代码\alert{穿越 TCB 边界}
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[syzcard,title={\faBug\ 挑战三：Rust panic 无法识别与去重}]
+  \aster{} 的 \code{Uncaught panic:} 报告与 Linux Oops/KASAN 格式不同，
+  \syz{} 无法感知内核问题 $\to$ \alert{漏报}或\alert{重复报告}
+\end{tcolorbox}
+\end{column}
+\begin{column}{0.49\textwidth}
+\begin{tcolorbox}[rustcard,title={\faEyeSlash\ 挑战二：覆盖与符号接口缺失}]
+  \aster{} 没有 kcov 子系统和 \code{debugfs}
+  $\to$ \alert{得不到覆盖反馈}；没有 \code{/proc/kallsyms}
+  $\to$ \alert{PC 无法映射回源码}，模糊测试退化为盲测
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[syzcard,title={\faHourglassHalf\ 挑战四：整机重启开销高}]
+  \aster{} 依托完整的 NixOS 根文件系统，整机重启耗时长；
+  频繁重置目标机会\alert{严重压缩有效测试时间}
+\end{tcolorbox}
+\end{column}
+\end{columns}
+
+\vspace{2mm}
+\centering\small
+\textcolor{SARust}{\rule{2.5mm}{2.5mm}}\ 内核侧问题（\sa{} 的 Rust 组件解决）
+\qquad
+\textcolor{SASyz}{\rule{2.5mm}{2.5mm}}\ \syz{} 侧问题（\syz{} 适配解决）
+\end{frame}

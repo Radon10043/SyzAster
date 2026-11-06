@@ -1,0 +1,62 @@
+% ===============================================================
+% 总结与展望
+% ===============================================================
+\section{总结与展望}
+
+% ---------------------------------------------------------------
+\begin{frame}{总结与展望}
+\begin{columns}[T,onlytextwidth]
+\begin{column}{0.57\textwidth}
+\textbf{工作总结}
+
+\vspace{1mm}
+\begin{tcolorbox}[rustcard,title={面向框内核的覆盖制导灰盒模糊测试}]
+  插桩边界与 TCB 边界重合；用 Rust 在 OSTD 中实现无递归、无死锁、
+  抵御敌意共享内存的覆盖收集；提供 Linux 兼容的 \code{/dev/kcov}，
+  并让 \syz{} 识别 Rust panic
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[syzcard,title={自适应内核生命周期管理}]
+  带折扣的 LinUCB 在继续、检查点、软重启、硬重启之间决策，降低整机重启开销
+\end{tcolorbox}
+\vspace{1mm}
+\begin{tcolorbox}[tcbcard,title={完整的工程闭环}]
+  从打补丁到统计评估的一站式流程，支持 \aster{} v0.18.1 与 v0.19.0
+\end{tcolorbox}
+\end{column}
+\begin{column}{0.39\textwidth}
+\textbf{未来工作}
+
+\vspace{1mm}
+\begin{itemize}\small
+  \item \textbf{多架构}：从 x86\_64 扩展到 ARM64、RISC-V
+  \item \textbf{异步覆盖}：面向 \code{async}/\code{await} 状态机的细粒度反馈
+  \item \textbf{规约生成}：从 AST 与类型系统中提取 syzlang 规约
+\end{itemize}
+
+\vspace{2mm}
+\centering
+\qrcode[height=1.9cm]{\repourl}
+
+\vspace{1mm}
+{\scriptsize\faGithub\ \url{\repourl}}
+\end{column}
+\end{columns}
+\end{frame}
+
+% ---------------------------------------------------------------
+\begin{frame}[standout]
+  \vspace*{0pt}
+  {\LARGE 谢谢！}
+
+  \vspace{3mm}
+  {\large 敬请各位评委批评指正}
+
+  \vspace{5mm}
+  \begin{tcolorbox}[enhanced,colback=white,colframe=white,arc=3pt,center,
+      width=2.9cm,halign=flush center,left=2pt,right=2pt,top=2pt,bottom=2pt]
+    \qrcode[height=2.4cm]{\repourl}
+  \end{tcolorbox}
+
+  {\scriptsize\url{\repourl}}
+\end{frame}
