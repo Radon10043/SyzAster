@@ -20,7 +20,8 @@ clear_child_tid.
  .../process/ptrace/traceme_no_cap.c           | 53 +++++++++++++++++++
  .../src/regression/process/run_test.sh        |  3 ++
  .../src/regression/process/set_tid_address.c  | 22 ++++++++
- 11 files changed, 149 insertions(+), 14 deletions(-)
+ tools/nixos/build_nixos.sh                    |  4 ++
+ 12 files changed, 153 insertions(+), 14 deletions(-)
  create mode 100644 test/initramfs/src/regression/process/ptrace/traceme_no_cap.c
  create mode 100644 test/initramfs/src/regression/process/set_tid_address.c
 
@@ -330,6 +331,21 @@ index 000000000..ef3e4700d
 +	TEST_RES(syscall(SYS_set_tid_address, NULL), _ret == tid);
 +}
 +END_TEST()
+diff --git a/tools/nixos/build_nixos.sh b/tools/nixos/build_nixos.sh
+index 817fc8916..95f955e58 100755
+--- a/tools/nixos/build_nixos.sh
++++ b/tools/nixos/build_nixos.sh
+@@ -7,6 +7,10 @@ set -e
+ TARGET_ARCH=${TARGET_ARCH:-x86_64}
+ # Accept config file name as parameter, default to "configuration.nix"
+ CONFIG_FILE_NAME=${1:-"configuration.nix"}
++RELEASE_SUBSTITUTER=${RELEASE_SUBSTITUTER:-https://aster-nixos-release.cachix.org}
++RELEASE_TRUSTED_PUBLIC_KEY=${RELEASE_TRUSTED_PUBLIC_KEY:-aster-nixos-release.cachix.org-1:xB6U/f5ck5vGDJZ04kPp3zGpZ4Nro9X4+TSSMAETVFE=}
++DEV_SUBSTITUTER=${DEV_SUBSTITUTER:-https://aster-nixos-dev.cachix.org}
++DEV_TRUSTED_PUBLIC_KEY=${DEV_TRUSTED_PUBLIC_KEY:-aster-nixos-dev.cachix.org-1:xrCbE2flfliFTQCY/2HeJoT2tCO+5kMTZeLIUH9lnIA=}
+ 
+ SCRIPT_DIR=$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)
+ ASTERINAS_DIR=$(realpath ${SCRIPT_DIR}/../..)
 -- 
 2.43.0
 
