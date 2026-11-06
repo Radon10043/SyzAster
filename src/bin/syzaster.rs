@@ -1,6 +1,6 @@
 use std::env;
 use std::process;
-use syzaster::pkg::{eval, kcov};
+use syzaster::pkg::{eval, kcov, tui};
 
 fn print_help(prog: &str) {
     println!(
@@ -13,6 +13,7 @@ Subcommands:
   check-inst              Verify Rust compiler and KCOV wrapper instrumentation
   kcov-rustc              Rust compiler wrapper for KCOV=1 builds
   eval-fuzz               Evaluate fuzzing campaign coverage, crashes, A12, and p-values
+  tui                     Interactive terminal UI: kernel, fuzzer config and monitor
   help                    Show this help message"
     );
 }
@@ -35,6 +36,7 @@ fn main() {
         }
         "kcov-rustc" => kcov::run_kcov_rustc(sub_args),
         "eval" | "eval-fuzz" => eval::run_eval_fuzz("syzaster eval-fuzz", sub_args),
+        "tui" => tui::run_tui("syzaster tui", sub_args),
         "-h" | "--help" | "help" => {
             print_help(prog);
             Ok(())

@@ -2,6 +2,7 @@ pub mod elf;
 pub mod eval;
 pub mod json;
 pub mod kcov;
+pub mod tui;
 
 use std::env;
 use std::fs;
