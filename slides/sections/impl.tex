@@ -4,7 +4,7 @@
 \section{系统实现}
 
 % ---------------------------------------------------------------
-\begin{frame}{\code{/dev/kcov} 与 \code{/proc/kallsyms}：与 Linux 兼容的观测接口}
+\begin{frame}{\code{/dev/kcov} 和 \code{/proc/kallsyms}}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.64\textwidth}
 \footnotesize
@@ -22,10 +22,6 @@
   /proc/kallsyms & 只允许 root 读取，导出链接脚本锚定的 \code{\_stext}、\code{\_etext} \\
   \bottomrule
 \end{tabularx}
-
-\vspace{2mm}
-{\scriptsize\muted{\aster{} 补丁 0002（v0.19.0）：20 个文件、+729 行，核心为
-\code{ostd/src/kcov.rs}、\code{device/misc/kcov.rs}、\code{procfs/kallsyms.rs}}}
 \end{column}
 \begin{column}{0.33\textwidth}
 \begin{tcolorbox}[rustcard,title={回调路径零分配},fontupper=\footnotesize]
@@ -45,21 +41,21 @@
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{\syz{} 与 \aster{} 的适配}
+\begin{frame}{\syz{} 适配}
 \begin{tcbraster}[raster columns=3,raster equal height,raster column skip=2mm]
-\begin{tcolorbox}[syzcard,title={0001\ 执行器}]
+\begin{tcolorbox}[syzcard,title={执行器}]
   \code{debugfs} 不存在时回退到 \code{/dev/kcov}；放宽可选特性检查
 \end{tcolorbox}
-\begin{tcolorbox}[syzcard,title={0002\ 符号解析}]
+\begin{tcolorbox}[syzcard,title={符号解析}]
   回退到 \code{\_\_stext}；无覆盖对照组可缺失 \code{kallsyms}
 \end{tcolorbox}
-\begin{tcolorbox}[syzcard,title={0004 / 0005}]
-  QEMU 配置样例；自适应生命周期（见创新二）
+\begin{tcolorbox}[syzcard,title={虚拟机管理}]
+  \aster{} 的 QEMU 配置；快照与自适应生命周期管理
 \end{tcolorbox}
 \end{tcbraster}
 
 \vspace{1mm}
-\begin{tcolorbox}[syzcard,title={0003\ Rust panic 报告解析（示例取自补丁中的单元测试）}]
+\begin{tcolorbox}[syzcard,title={Rust panic 报告解析}]
 \begin{minipage}[c]{0.65\linewidth}
   \begin{tcolorbox}[terminal]
 \textcolor{SATcb!60}{[\ \ 91.693]} ERROR: Uncaught panic:\\
@@ -80,13 +76,13 @@ asterinas panic: not implemented at src/syscall/\allowbreak timer\_create.rs:LIN
 \end{tcolorbox}
 
 \vspace{1mm}
-{\scriptsize\muted{\faIcon{wrench}\ \aster{} 补丁 0001 另修复了移植中遇到的问题（\textbf{非}模糊测试发现）：
+{\scriptsize\muted{\faIcon{wrench}\ 移植中另修复了 \aster{} 的问题（\textbf{非}模糊测试发现）：
 NixOS 镜像安装与串口控制台、\code{PTRACE\_TRACEME} 在 Yama 下重复加锁父进程导致的死锁、
 \code{sys\_set\_tid\_address} 中的 \code{todo!()} panic，均附带回归测试}}
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{Rust 工具链与终端界面}
+\begin{frame}{Rust 工具链和 TUI}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.5\textwidth}
 \small
@@ -109,7 +105,7 @@ NixOS 镜像安装与串口控制台、\code{PTRACE\_TRACEME} 在 Yama 下重复
 \end{column}
 \begin{column}{0.47\textwidth}
 \centering
-\imageorplaceholder{images/tui-monitor.png}{\linewidth}{3.6cm}{\code{syzaster tui} 监控页}
+\imageorplaceholder{images/SyzAster.png}{\linewidth}{4.6cm}{\code{syzaster tui} 监控页}
 
 \vspace{1mm}
 {\scriptsize 内核配置 · 模糊测试配置 · 监控（覆盖、崩溃、执行速度曲线与问题列表）}
@@ -127,7 +123,7 @@ NixOS 镜像安装与串口控制台、\code{PTRACE\_TRACEME} 在 Yama 下重复
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{Rust 语言特性在 \sa{} 中的运用}
+\begin{frame}{Rust 特性}
 \small
 \renewcommand{\arraystretch}{1.45}
 \begin{tabularx}{\textwidth}{@{}>{\raggedright}p{3.7cm}>{\raggedright}p{4.4cm}

@@ -4,7 +4,7 @@
 \section{项目背景}
 
 % ---------------------------------------------------------------
-\begin{frame}{\aster{}：Rust 编写的框内核操作系统}
+\begin{frame}{\aster{}}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.47\textwidth}
 \centering
@@ -56,7 +56,7 @@
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{\syz{}：系统调用级覆盖制导内核模糊测试}
+\begin{frame}{\syz{}}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.56\textwidth}
 \centering
@@ -84,11 +84,6 @@
   \draw[flow] (kern) -- node[below,font=\scriptsize]{崩溃} (crash);
   \draw[flow] (crash) -- node[right,font=\scriptsize,align=left]{解析去重\\重启 VM}
     (mgr);
-  % 对 Linux 宏内核的假设
-  \node[tag] at (kern.south east) {1};
-  \node[tag] at (exe.north east) {2};
-  \node[tag] at (crash.south west) {3};
-  \node[tag] at (mgr.south west) {4};
 \end{tikzpicture}
 
 \vspace{2mm}
@@ -98,55 +93,49 @@
 \textbf{依赖的 Linux 宏内核假设}
 
 \vspace{1.5mm}
-\small
-\begin{tabular}{@{}c@{\hspace{2mm}}p{0.84\linewidth}@{}}
-  \tikz\node[tag]{1}; & 编译期对\textbf{整个内核}插入覆盖回调，靠手工排除列表跳过 kcov 自身 \\[1mm]
-  \tikz\node[tag]{2}; & 通过 \code{debugfs} 的 kcov 获取覆盖，借 \code{/proc/kallsyms} 符号化 \\[1mm]
-  \tikz\node[tag]{3}; & 按 Oops、KASAN 的报告格式识别崩溃并去重 \\[1mm]
-  \tikz\node[tag]{4}; & 每次崩溃后\textbf{完整重启}目标机 \\
-\end{tabular}
+\begin{itemize}\small
+  \item 编译期对\textbf{整个内核}插入覆盖回调，靠手工排除列表跳过 kcov 自身
+  \item 通过 \code{debugfs} 的 kcov 获取覆盖，借 \code{/proc/kallsyms} 符号化
+  \item 按 Oops、KASAN 的报告格式识别崩溃并去重
+  \item 每次崩溃后\textbf{完整重启}目标机
+\end{itemize}
 
 \vspace{2mm}
 \begin{tcolorbox}[syzcard,fontupper=\small]
   \aster{} 提供 Linux 兼容 ABI，可以直接运行 \syz{} 的测试程序，
-  但以上四条假设\alert{在框内核上都不成立}
+  但将 \syz{} 应用于测试 \aster{} 上存在 \alert{4 个挑战}
 \end{tcolorbox}
 \end{column}
 \end{columns}
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{把 \syz{} 移植到框内核的四大挑战}
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
+\begin{frame}{挑战}
+\begin{tcbraster}[raster columns=2,raster equal height=rows,
+    raster column skip=2mm,raster row skip=2mm]
 \begin{tcolorbox}[rustcard,title={\faIcon{sync-alt}\ 挑战一：插桩与运行时互相干扰}]
   全内核注入 SanitizerCoverage 后，回调依赖的任务查询、自旋锁也被插桩
   $\to$ \alert{无限递归}；中断上下文的探针与持锁任务争用 $\to$ \alert{死锁}；
   跨 crate LTO 使插桩代码\alert{穿越 TCB 边界}
 \end{tcolorbox}
-\vspace{1mm}
-\begin{tcolorbox}[syzcard,title={\faBug\ 挑战三：Rust panic 无法识别与去重}]
-  \aster{} 的 \code{Uncaught panic:} 报告与 Linux Oops/KASAN 格式不同，
-  \syz{} 无法感知内核问题 $\to$ \alert{漏报}或\alert{重复报告}
-\end{tcolorbox}
-\end{column}
-\begin{column}{0.49\textwidth}
 \begin{tcolorbox}[rustcard,title={\faEyeSlash\ 挑战二：覆盖与符号接口缺失}]
   \aster{} 没有 kcov 子系统和 \code{debugfs}
   $\to$ \alert{得不到覆盖反馈}；没有 \code{/proc/kallsyms}
   $\to$ \alert{PC 无法映射回源码}，模糊测试退化为盲测
 \end{tcolorbox}
-\vspace{1mm}
+\begin{tcolorbox}[syzcard,title={\faBug\ 挑战三：Rust panic 无法识别与去重}]
+  \aster{} 的 \code{Uncaught panic:} 报告与 Linux Oops/KASAN 格式不同，
+  \syz{} 无法感知内核问题 $\to$ \alert{漏报}或\alert{重复报告}
+\end{tcolorbox}
 \begin{tcolorbox}[syzcard,title={\faHourglassHalf\ 挑战四：整机重启开销高}]
   \aster{} 依托完整的 NixOS 根文件系统，整机重启耗时长；
   频繁重置目标机会\alert{严重压缩有效测试时间}
 \end{tcolorbox}
-\end{column}
-\end{columns}
+\end{tcbraster}
 
 \vspace{2mm}
 \centering\small
-\textcolor{SARust}{\rule{2.5mm}{2.5mm}}\ 内核侧问题（\sa{} 的 Rust 组件解决）
+\textcolor{SARust}{\rule{2.5mm}{2.5mm}}\ 内核侧问题
 \qquad
-\textcolor{SASyz}{\rule{2.5mm}{2.5mm}}\ \syz{} 侧问题（\syz{} 适配解决）
+\textcolor{SASyz}{\rule{2.5mm}{2.5mm}}\ \syz{} 侧问题
 \end{frame}

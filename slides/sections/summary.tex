@@ -45,6 +45,8 @@
 \end{frame}
 
 % ---------------------------------------------------------------
+% 致谢页使用白色背景（metropolis 的 standout 取 palette primary 配色）
+{\setbeamercolor{palette primary}{fg=SAText,bg=white}
 \begin{frame}[standout]
   \vspace*{0pt}
   {\LARGE 谢谢！}
@@ -53,10 +55,11 @@
   {\large 敬请各位评委批评指正}
 
   \vspace{5mm}
-  \begin{tcolorbox}[enhanced,colback=white,colframe=white,arc=3pt,center,
+  \begin{tcolorbox}[enhanced,colback=white,colframe=SATcbFill,arc=3pt,center,
       width=2.9cm,halign=flush center,left=2pt,right=2pt,top=2pt,bottom=2pt]
     \qrcode[height=2.4cm]{\repourl}
   \end{tcolorbox}
 
   {\scriptsize\url{\repourl}}
 \end{frame}
+}

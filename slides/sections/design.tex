@@ -4,7 +4,7 @@
 \section{技术方案}
 
 % ---------------------------------------------------------------
-\begin{frame}{\sa{} 总体架构}
+\begin{frame}{\sa{}}
 \begin{columns}[c,onlytextwidth]
 \begin{column}{0.71\textwidth}
 \centering
@@ -19,7 +19,7 @@
   插桩点回调 \code{ostd::kcov}，PC 写入\textbf{共享 VMO}，执行器零拷贝读取
 \end{tcolorbox}
 \vspace{1mm}
-\begin{tcolorbox}[syzcard,title={端到端流程},fontupper=\footnotesize]
+\begin{tcolorbox}[syzcard,title={工作流程},fontupper=\footnotesize]
   打补丁 $\to$ 插桩构建 $\to$ 镜像 $\to$ 模糊测试 $\to$ 分诊复现 $\to$ 统计评估
 \end{tcolorbox}
 \end{column}
@@ -27,42 +27,22 @@
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{从挑战到方案}
-\small
-\renewcommand{\arraystretch}{1.3}
-\begin{tabularx}{\textwidth}{@{}>{\bfseries}p{2.2cm}>{\raggedright\arraybackslash}X
-    >{\raggedright\arraybackslash}p{3.3cm}@{}}
+\begin{frame}{\sa{}}
+\renewcommand{\arraystretch}{1.6}
+\begin{tabularx}{\textwidth}{@{}>{\bfseries}p{2.6cm}>{\raggedright\arraybackslash}X@{}}
   \toprule
-  \normalfont\muted{挑战} & \muted{\sa{} 的方案} & \muted{实现组件} \\
+  \normalfont\muted{挑战} & \muted{\sa{} 的方案} \\
   \midrule
   \textcolor{SARust}{插桩互相干扰}
     & \hl{插桩边界 = TCB 边界}：只插桩 \code{aster\_core}，禁用跨 crate LTO；
-      只在任务上下文中以非重入方式记录 PC
-    & \code{kcov-rustc}、\code{check-kcov-inst}、\code{ostd::kcov} \\
+      只在任务上下文中以非重入方式记录 PC \\
   \textcolor{SARust}{观测接口缺失}
     & 与 Linux 兼容的 \code{/dev/kcov}（共享 VMO）和 \code{/proc/kallsyms}；
-      执行器与符号解析自动回退
-    & \aster{} 补丁 0002；\syz{} 补丁 0001、0002 \\
+      执行器与符号解析自动回退 \\
   \textcolor{SASyz}{panic 无法解析}
-    & 识别 \code{Uncaught panic:}，提取原因与源码位置；截断路径、归一化行号后去重
-    & \syz{} 补丁 0003 \\
+    & 识别 \code{Uncaught panic:}，提取原因与源码位置；截断路径、归一化行号后去重 \\
   \textcolor{SASyz}{重启开销高}
-    & \hl{快照库 + LinUCB 上下文多臂老虎机}：在继续、检查点、软重启、硬重启之间自适应决策
-    & \syz{} 补丁 0005 \\
+    & \hl{快照库 + LinUCB 上下文多臂老虎机}：在继续、检查点、软重启、硬重启之间自适应决策 \\
   \bottomrule
 \end{tabularx}
-
-\vspace{3mm}
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.49\textwidth}
-\begin{tcolorbox}[rustcard,title={核心创新一（应对挑战一、二）}]
-  面向框内核的覆盖制导灰盒模糊测试
-\end{tcolorbox}
-\end{column}
-\begin{column}{0.49\textwidth}
-\begin{tcolorbox}[syzcard,title={核心创新二（应对挑战四）}]
-  自适应内核生命周期管理
-\end{tcolorbox}
-\end{column}
-\end{columns}
 \end{frame}

@@ -1,152 +1,18 @@
 % ===============================================================
 % 运行效果
-% 数据集中在 data/results.tex；时间线读取可选的 data/timeline.csv
+% 问题标题集中在 data/results.tex
 % ===============================================================
 \section{运行效果}
 
 % ---------------------------------------------------------------
-\begin{frame}{正确性验证}
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.53\textwidth}
-\textbf{\small 宿主机：插桩边界与回归测试（实测输出）}
-
-\vspace{1mm}
-\begin{tcolorbox}[terminal]
-\textcolor{SAAccent!60}{\$} ./bin/check-kcov-inst\\
-\textcolor{SAOk!70}{PASS}: safe kernel gets trace-pc callbacks;\\
-\hspace*{4.2em}OSTD remains uninstrumented\\[3pt]
-\textcolor{SAAccent!60}{\$} make test\\
-test result: \textcolor{SAOk!70}{ok}. 36 passed; 0 failed; ...\\
-test result: \textcolor{SAOk!70}{ok}. \ 5 passed; 0 failed; ...\\
-test result: \textcolor{SAOk!70}{ok}. \ 3 passed; 0 failed; ...\\
-test result: \textcolor{SAOk!70}{ok}. \ 3 passed; 0 failed; ...
-\end{tcolorbox}
-
-\vspace{1mm}
-\begin{tcolorbox}[syzcard]
-  对 \syz{} 和 \aster{} 的改动均通过二者\textbf{原有的全部单元测试}；
-  内核 ktest 覆盖共享计数被改为 \code{usize::MAX} 的场景
-\end{tcolorbox}
-\end{column}
-\begin{column}{0.44\textwidth}
-\begin{tcolorbox}[rustcard,title={\faServer\ 目标机：\code{check-asterinas-kcov}}]
-  在运行中的 VM 内执行 \code{kcov-smoke.c}，逐项检查：
-  \begin{itemize}
-    \item PC 全部落在 \code{[\_stext, \_etext)} 内
-    \item 非法 \code{ioctl} 返回 \code{EINVAL}、\code{EBUSY}
-    \item 只接受完整的共享映射
-    \item 篡改共享计数\textbf{不会}越界写
-    \item 所有权、\code{fork}、线程退出与 Linux 一致
-  \end{itemize}
-\end{tcolorbox}
-\vspace{1mm}
-\begin{tcolorbox}[accentcard]
-  插桩的 \aster{} 内核与 NixOS 已在 QEMU 中运行覆盖制导模糊测试
-\end{tcolorbox}
-\end{column}
-\end{columns}
-\end{frame}
-
-% ---------------------------------------------------------------
-\begin{frame}{模糊测试设置与总体发现}
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.44\textwidth}
-\small
-\textbf{实验设置}
-
-\vspace{1mm}
-\renewcommand{\arraystretch}{1.3}
-\begin{tabularx}{\linewidth}{@{}>{\color{SATcb}}lX@{}}
+\begin{frame}{发现问题}
+\scriptsize
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\textwidth}{@{}r>{\raggedright\arraybackslash\ttfamily}X@{}}
   \toprule
-  被测内核 & \aster{} \ResKernel \\
-  测试时长 & \ResDuration \\
-  虚拟机 & \ResVMs \\
-  测试配置 & \ResProfiles \\
-  重复次数 & \ResTrials \\
-  宿主机 & \ResHost \\
-  \bottomrule
-\end{tabularx}
-
-\vspace{2mm}
-\begin{tcbraster}[raster columns=2,raster equal height,raster column skip=2mm,
-  raster row skip=2mm]
-\stattile{accentcard}{\ResUniqueIssues}{独特问题}
-\stattile{rustcard}{\ResPanics}{内核 panic}
-\stattile{tcbcard}{\ResHangs}{死锁 / 挂起}
-\stattile{syzcard}{\ResReported}{已上报 / 已确认}
-\end{tcbraster}
-\end{column}
-\begin{column}{0.53\textwidth}
-\textbf{\small 累计独特问题数随时间的变化}
-
-\vspace{1mm}
-\IfFileExists{data/timeline.csv}{%
-  \begin{tikzpicture}
-    \begin{axis}[width=\linewidth,height=6.3cm,
-        xlabel={测试时间（小时）},ylabel={累计独特问题数},
-        xmin=0,ymin=0,grid=major,grid style={SATcbFill},
-        axis lines=left,tick label style={font=\scriptsize},
-        /pgf/number format/assume math mode=true,
-        label style={font=\small}]
-      \addplot[const plot,SAAccent,line width=1.2pt,mark=*,mark size=1.2pt]
-        table[col sep=comma,x=hours,y=issues]{data/timeline.csv};
-    \end{axis}
-  \end{tikzpicture}%
-}{%
-  \begin{tikzpicture}
-    \node[draw=SAAccent,dashed,line width=0.8pt,fill=SAAccent!5,
-      minimum width=\linewidth,minimum height=5.9cm,rounded corners=2pt,
-      align=center,text=SAAccent,font=\small] {%
-      \faChartLine\quad\textbf{累计独特问题数—时间曲线}\\[3pt]
-      \scriptsize 提供 \code{slides/data/timeline.csv}（列：\code{hours,issues}）后自动绘制};
-  \end{tikzpicture}%
-}
-\end{column}
-\end{columns}
-\end{frame}
-
-% ---------------------------------------------------------------
-\begin{frame}{\sa{} 在 \aster{} 中发现的问题}
-\small
-\renewcommand{\arraystretch}{1.45}
-\begin{tabularx}{\textwidth}{@{}c X c c c@{}}
-  \toprule
-  \textbf{\#} & \textbf{去重标题（\syz{} 自动生成）} & \textbf{类型} & \textbf{子系统}
-    & \textbf{状态} \\
+  \textbf{\#} & \normalfont\textbf{标题} \\
   \midrule
   \IssueRows
   \bottomrule
 \end{tabularx}
-
-\vspace{2mm}
-{\footnotesize\muted{类型：panic（\code{unwrap}/断言/\code{todo!} 等）、死锁或挂起、
-Linux 语义偏差；状态：已上报 / 已确认 / 已修复}}
-\end{frame}
-
-% ---------------------------------------------------------------
-\begin{frame}{典型问题案例}
-\begin{columns}[T,onlytextwidth]
-\begin{column}{0.5\textwidth}
-\begin{tcolorbox}[syzcard,title={\faBolt\ 触发程序（\syz{} 重现程序）}]
-  \ttfamily\scriptsize \CaseRepro
-\end{tcolorbox}
-\centering\vspace{-0.5mm}{\large\textcolor{SATcb}{$\Downarrow$}}\vspace{-0.5mm}
-\begin{tcolorbox}[tcbcard,title={\faIcon{terminal}\ 内核串口日志}]
-  \ttfamily\scriptsize \CaseLog
-\end{tcolorbox}
-\end{column}
-\begin{column}{0.47\textwidth}
-\begin{tcolorbox}[accentcard,title={\faBug\ 去重标题}]
-  \ttfamily\scriptsize \CaseTitle
-\end{tcolorbox}
-\vspace{1mm}
-\begin{tcolorbox}[rustcard,title={\faSearch\ 根因分析}]
-  \CaseRootCause
-\end{tcolorbox}
-\vspace{1mm}
-\begin{tcolorbox}[tcbcard,title={\faIcon{check-circle}\ 上游状态}]
-  \CaseStatus
-\end{tcolorbox}
-\end{column}
-\end{columns}
 \end{frame}

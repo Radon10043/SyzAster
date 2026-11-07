@@ -1,10 +1,9 @@
 % ===============================================================
-% 核心创新
+% 核心创新（并入“技术方案”一节，不单独设节）
 % ===============================================================
-\section{核心创新}
 
 % ---------------------------------------------------------------
-\begin{frame}[fragile]{创新一：插桩边界 = TCB 边界}
+\begin{frame}[fragile]{\sa{}：插桩边界}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.43\textwidth}
 \centering
@@ -55,15 +54,15 @@ if crate_name == Some("aster_core")
 \begin{tcolorbox}[accentcard,title={\faIcon{check-circle}\ 秒级前置校验：\code{check-kcov-inst}}]
   把一个 \code{\#![no\_std]} 探针 crate 分别以 \code{aster\_core} 和 \code{ostd}
   的身份编译，再用自研 ELF 解析器断言：前者\textbf{引用}
-  \code{\_\_sanitizer\_cov\_trace\_pc}，后者\textbf{不引用}。\\[2pt]
-  实测 \hl{0.13 s}，不必等待完整的内核构建
+  \code{\_\_sanitizer\_cov\_trace\_pc}，后者\textbf{不引用}，
+  不必等待完整的内核构建
 \end{tcolorbox}
 \end{column}
 \end{columns}
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}[fragile]{创新一：无递归、无死锁的覆盖运行时（\code{ostd::kcov}）}
+\begin{frame}[fragile]{\sa{}：\code{ostd::kcov}}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.56\textwidth}
 \begin{lstlisting}
@@ -78,16 +77,12 @@ extern "C" fn record_pc(pc: usize) {
     || !InterruptLevel::current().is_task_context()
   { return; }
   let Some(task) = Task::current() else { return };
-  // 绝不自旋：嵌套调用直接丢弃
+  // 丢弃嵌套调用
   let Some(slot) = task.kcov.try_lock()
     else { return };
   if let Some(a) = slot.as_ref() { a.0.record(pc); }
 }
 \end{lstlisting}
-{\scriptsize\muted{节选自 \aster{} 补丁 0002 的 \code{ostd/src/kcov.rs}，略有简化}}
-
-\vspace{1mm}
-{\small 汇编只有\textbf{两条指令}，其余逻辑全部回到编译器可检查的安全 Rust}
 \end{column}
 \begin{column}{0.41\textwidth}
 \centering
@@ -109,15 +104,14 @@ extern "C" fn record_pc(pc: usize) {
 
 \vspace{2mm}
 \begin{tcolorbox}[accentcard]
-  最坏情况只\textbf{丢一个样本}，绝不死锁；与 Linux kcov
-  “只记录任务上下文”的语义一致
+  与 Linux kcov “只记录任务上下文”的语义一致
 \end{tcolorbox}
 \end{column}
 \end{columns}
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}[fragile]{创新一：把共享内存当作敌意输入}
+\begin{frame}[fragile]{\sa{}：共享内存当作敌意输入}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.57\textwidth}
 \textbf{\small\code{KcovBuffer::record}：首个字是用户态可改写的 PC 计数}
@@ -158,19 +152,20 @@ fn record(&self, pc: usize) {
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{创新二：自适应内核生命周期管理}
+\begin{frame}{\sa{}：自适应内核生命周期管理}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.56\textwidth}
 \centering
 \begin{tikzpicture}[
-    act/.style={box,minimum width=2.9cm,text width=2.75cm,minimum height=0.95cm,
-      font=\scriptsize,inner sep=2pt}]
+    act/.style={box,minimum width=2.9cm,text width=2.75cm,minimum height=1.05cm,
+      font=\scriptsize\linespread{1.4}\selectfont,inner sep=3pt}]
   \node[act,rustbox] (cont) {\textbf{继续模糊测试}\\停机时间为 0};
-  \node[act,rustbox,below=2mm of cont] (ckpt) {\textbf{保存检查点}\\QMP \code{savevm}};
-  \node[act,syzbox,below=2mm of ckpt] (soft)
+  \node[act,rustbox,below=3mm of cont] (ckpt) {\textbf{保存检查点}\\QMP \code{savevm}};
+  \node[act,syzbox,below=3mm of ckpt] (soft)
     {\textbf{软重启}：从快照库\\\textbf{随机}选取，QMP \code{loadvm}};
-  \node[act,tcbbox,below=2mm of soft] (hard) {\textbf{硬重启}\\重建 VM 实例};
-  \node[syzbox,font=\scriptsize,text width=1.9cm,minimum height=4.4cm,
+  \node[act,tcbbox,below=3mm of soft] (hard) {\textbf{硬重启}\\重建 VM 实例};
+  \node[syzbox,font=\scriptsize\linespread{1.4}\selectfont,text width=1.9cm,
+    minimum height=5.0cm,
     left=8mm of $(ckpt.west)!0.5!(soft.west)$] (ctl)
     {\textbf{\small 自适应\\控制器}\\[4pt]每个窗口\\每台 VM\\[4pt]
      16 维上下文 $x$\\[4pt]LinUCB\\选择动作};
@@ -178,11 +173,12 @@ fn record(&self, pc: usize) {
     \draw[flow] (ctl.east|-\n.west) -- (\n.west);
   \node[draw=SATcb,cylinder,shape border rotate=90,aspect=0.25,
     fill=SATcbFill!60,minimum width=1.5cm,minimum height=1.3cm,align=center,
-    font=\scriptsize,right=5mm of $(ckpt.east)!0.5!(soft.east)$] (bank)
+    font=\scriptsize\linespread{1.4}\selectfont,minimum height=1.9cm,
+    right=7mm of $(ckpt.east)!0.5!(soft.east)$] (bank)
     {快照库\\\code{delvm}\\回收};
-  \draw[flow,SASyz] (ckpt.east) -| node[pos=0.25,above,font=\tiny,text=SASyz]{存入}
-    (bank.north);
-  \draw[flow,SASyz] (bank.south) |- node[pos=0.75,below,font=\tiny,text=SASyz]{恢复}
+  \draw[flow,SASyz] (ckpt.east) -- node[above,font=\tiny,text=SASyz]{存入}
+    (ckpt.east-|bank.west);
+  \draw[flow,SASyz] (soft.east-|bank.west) -- node[below,font=\tiny,text=SASyz]{恢复}
     (soft.east);
 \end{tikzpicture}
 \end{column}
@@ -197,28 +193,21 @@ fn record(&self, pc: usize) {
   \item 检查点把有价值的内核状态留在快照库中，随机恢复以保持多样性
   \item 只有状态确实变坏时才付出硬重启的代价
 \end{itemize}
-
-\vspace{1mm}
-\textbf{工程实现}（\syz{} 补丁 0005）
-\begin{itemize}
-  \item QEMU 后端新增 QMP \code{savevm}、\code{loadvm}、\code{delvm}
-  \item 校准并\textbf{固定 TSC 频率}，快照恢复后客户机时钟保持一致
-\end{itemize}
 \end{column}
 \end{columns}
 \end{frame}
 
 % ---------------------------------------------------------------
-\begin{frame}{创新二：基于带折扣 LinUCB 的动作选择}
+\begin{frame}{\sa{}：自适应内核生命周期管理}
 \begin{columns}[T,onlytextwidth]
 \begin{column}{0.5\textwidth}
 \begin{tcolorbox}[syzcard,title={上下文多臂老虎机}]
-  每个动作 $a$ 维护 $A_a \in \mathbb{R}^{16\times16}$ 与 $\mathbf{b}_a$：
+  每个动作 $a$ 维护 $A_a \in \mathbb{R}^{16\times16}$ 与 $\mathbf{b}_a$，
+  $\hat{\boldsymbol\theta}_a = A_a^{-1}\mathbf{b}_a$：
   \[
     a^\ast = \arg\max_{a}\;
       \underbrace{\hat{\boldsymbol\theta}_a^{\top}x}_{\text{预期收益}}
-      + \alpha\underbrace{\sqrt{x^{\top}A_a^{-1}x}}_{\text{不确定性}},
-    \quad \hat{\boldsymbol\theta}_a = A_a^{-1}\mathbf{b}_a
+      + \alpha\underbrace{\sqrt{x^{\top}A_a^{-1}x}}_{\text{不确定性}}
   \]
   \vspace{-4mm}
   \begin{itemize}
