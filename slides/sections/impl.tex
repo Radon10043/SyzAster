@@ -75,10 +75,6 @@ asterinas panic: not implemented at src/syscall/\allowbreak timer\_create.rs:LIN
 路径只保留最后 3 级、行号归一化 $\Rightarrow$ 不同构建路径和代码行漂移下\textbf{仍能正确去重}
 \end{tcolorbox}
 
-\vspace{1mm}
-{\scriptsize\muted{\faIcon{wrench}\ 移植中另修复了 \aster{} 的问题（\textbf{非}模糊测试发现）：
-NixOS 镜像安装与串口控制台、\code{PTRACE\_TRACEME} 在 Yama 下重复加锁父进程导致的死锁、
-\code{sys\_set\_tid\_address} 中的 \code{todo!()} panic，均附带回归测试}}
 \end{frame}
 
 % ---------------------------------------------------------------
