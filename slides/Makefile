@@ -7,7 +7,8 @@ PDFINFO ?= pdfinfo
 MAIN    := slides
 SRC_TEX := $(MAIN).tex $(wildcard sections/*.tex) $(wildcard data/*.tex)
 SRC_DAT := $(wildcard data/*.csv) $(wildcard images/*.png) $(wildcard images/*.jpg)
-ARCH    := ../report/images/arch.pdf
+ARCH    := images/arch.pdf
+DRAWIO  ?= xvfb-run -a drawio --no-sandbox --disable-gpu --disable-dev-shm-usage
 TARGET  := $(MAIN).pdf
 
 LATEX_FLAGS := -interaction=nonstopmode -halt-on-error
@@ -25,11 +26,12 @@ $(TARGET): $(SRC_TEX) $(SRC_DAT) $(ARCH)
 	$(XELATEX) $(LATEX_FLAGS) $(MAIN).tex >/dev/null
 	@echo "==> Build successful: $(TARGET)"
 
-# 架构图与技术报告共用同一份 draw.io 源文件，由 report/Makefile 导出
+# 幻灯片版架构图：在 report/images/arch.drawio 的基础上改用
+# 黑体（Noto Sans CJK SC）+ 0xProto 字体，导出需要本机已安装 0xProto
 figures: $(ARCH)
 
-$(ARCH): ../report/images/arch.drawio
-	$(MAKE) -C ../report figures
+images/%.pdf: images/%.drawio
+	$(DRAWIO) -x -f pdf --crop -o $@ $<
 
 check: $(TARGET)
 	@if command -v $(PDFINFO) >/dev/null 2>&1; then \
