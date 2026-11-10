@@ -1,14 +1,14 @@
 # Framekernel-Aware KCOV Architecture & Verification
 
-Asterinas adopts a **framekernel** architecture that separates the OS into a minimal, unsafe Trusted Computing Base (**OSTD**) and a safe OS services layer (**`aster_core`**) written in safe Rust. **SyzAster** designs its coverage feedback mechanism around this boundary.
+Asterinas adopts a **framekernel** architecture that separates the OS into a minimal, unsafe Trusted Computing Base (**OSTD**) and a safe OS services layer (**`aster_core`** in `v0.18.1`+, or **`aster_kernel`** in `v0.17.1`–`v0.18.0`) written in safe Rust. **SyzAster** designs its coverage feedback mechanism around this boundary.
 
-## Selective `aster_core` SanitizerCoverage Instrumentation
+## Selective Safe-Kernel SanitizerCoverage Instrumentation
 
 Instrumenting the low-level runtime (`ostd`)—which implements context switching, page tables, interrupt handling, spinlocks, and the KCOV ring-buffer recorder itself—would cause infinite recursion or deadlocks inside `__sanitizer_cov_trace_pc`.
 
 SyzAster solves this via `kcov-rustc` (`src/pkg/kcov.rs` / `tools/kcov-rustc.sh`) and `Makefile` switches (`KCOV=1`):
-- Inspects `rustc` invocation arguments for `--crate-name aster_core` and `--target x86_64-unknown-none`.
-- Appends `-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc` **only** to `aster_core`.
+- Inspects `rustc` invocation arguments for `--crate-name aster_core` (or `--crate-name aster_kernel` on `v0.17.1`–`v0.18.0`) and `--target x86_64-unknown-none`.
+- Appends `-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc` **only** to `aster_core` / `aster_kernel`.
 - Disables cross-crate LTO (`CARGO_PROFILE_DEV_LTO=false`, `CARGO_PROFILE_RELEASE_LTO=false`) so LLVM cannot inline instrumented functions into uninstrumented OSTD routines or vice versa.
 
 ## Task-Scoped Coverage Recording in `ostd::kcov`

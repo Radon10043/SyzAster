@@ -8,12 +8,13 @@ Located under `configs/fuzz/asterinas/` and `experiment/configs/asterinas/`:
 
 | Subsystem | Config File | Targeted Syscall Families |
 | :--- | :--- | :--- |
-| **Whole Kernel** | `configs/fuzz/asterinas/kernel.cfg` | All Asterinas-compatible Linux syscalls (`KCOV=1`) |
-| **No-Cover Baseline** | `configs/fuzz/asterinas/nocover.cfg` | All Asterinas-compatible Linux syscalls (`KCOV=0`, `cover: false`) |
+| **Whole Kernel** | `configs/fuzz/asterinas/kernel.cfg` | All Asterinas-compatible Linux syscalls |
 | **Filesystem (`fs`)** | `configs/fuzz/asterinas/fs.cfg` | VFS, `ext2`, `exfat`, `ramfs`, `procfs`, `sysfs`, `epoll`, `inotify`, `pipe`, `eventfd`, `timerfd` |
 | **Network (`net`)** | `configs/fuzz/asterinas/net.cfg` | TCP/UDP/Unix sockets, `smoltcp` interface, `bind`, `connect`, `sendmsg`, `recvmsg`, `setsockopt` |
 | **Process (`process`)** | `configs/fuzz/asterinas/process.cfg` | `clone`, `fork`, `execve`, `wait4`, `futex`, signals, `ptrace`, credentials, POSIX timers |
 | **Memory (`mm`)** | `configs/fuzz/asterinas/mm.cfg` | `VMAR`, `Vmo`, page cache, `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `brk`, `memfd_create` |
+
+Coverage is a setting, not a separate template: the uninstrumented (`KCOV=0`) baseline is `kernel.cfg` with `"cover": false` and without `kernel_obj`, `kernel_src` and `kernel_build_src` (an uninstrumented image stages no `kernel/vmlinux`). The TUI and Web GUI write it that way when their Coverage toggle is off, and `compose.SyzAster-nocover.yaml` derives it from `kernel.cfg` with `jq`.
 
 ## Merging a Subsystem Config Manually
 

@@ -2,7 +2,7 @@
 
 **SyzAster** is an end-to-end coverage-guided kernel fuzzing prototype tool designed for the [Asterinas](https://github.com/asterinas/asterinas) Rust framekernel, built on top of [syzkaller](https://github.com/google/syzkaller) and a suite of purpose-built Rust verification, compiler-instrumentation, and evaluation tools.
 
-This document explains how to set up, build, and use **SyzAster** to fuzz the Asterinas kernel (`v0.18.1` and `v0.19.0`). Detailed documentation is also available for specific topics:
+This document explains how to set up, build, and use **SyzAster** to fuzz the Asterinas kernel (`v0.17.1`, `v0.17.2`, `v0.18.0`, `v0.18.1`, and `v0.19.0`). Detailed documentation is also available for specific topics:
 - [Asterinas Kernel & NixOS VM Setup](docs/asterinas.md)
 - [Framekernel-Aware KCOV Architecture & Verification](docs/kcov.md)
 - [Subsystem-Targeted Fuzzing & Ablation](docs/subsystem.md)
@@ -21,11 +21,11 @@ Asterinas adopts a **framekernel** architecture that divides the operating syste
 **SyzAster** addresses these challenges across four tightly integrated components:
 
 - **Framekernel-Selective KCOV Instrumentation (`bin/kcov-rustc`, `bin/check-kcov-inst`)**:
-  - Uses a Rust compiler wrapper (`kcov-rustc`) to selectively inject LLVM SanitizerCoverage (`-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc`) **only** when compiling the safe OS services crate (`--crate-name aster_core`) for `x86_64-unknown-none`.
+  - Uses a Rust compiler wrapper (`kcov-rustc`) to selectively inject LLVM SanitizerCoverage (`-C passes=sancov-module -C llvm-args=-sanitizer-coverage-level=3 -C llvm-args=-sanitizer-coverage-trace-pc`) **only** when compiling the safe OS services crate (`--crate-name aster_core`, or `aster_kernel` in `<= v0.18.0`) for `x86_64-unknown-none`.
   - Keeps the low-level framekernel runtime (`ostd`), page table manager, interrupt handlers, spinlocks, and the KCOV ring-buffer recorder itself uninstrumented, and disables cross-crate LTO (`CARGO_PROFILE_DEV_LTO=false`, `CARGO_PROFILE_RELEASE_LTO=false`) so LLVM cannot inline instrumented callbacks across the TCB boundary.
-- **Task-Scoped `/dev/kcov` & `/proc/kallsyms` (`patch/asterinas/v0.18.1/`, `patch/asterinas/v0.19.0/`)**:
+- **Task-Scoped `/dev/kcov` & `/proc/kallsyms` (`patch/asterinas/v0.17.1/` .. `patch/asterinas/v0.19.0/`)**:
   - Implements a naked `__sanitizer_cov_trace_pc` trampoline and non-reentrant `record_pc` runtime in `ostd::kcov` that records caller return addresses only in task context (`InterruptLevel::current().is_task_context()`) using `try_lock()` and shared anonymous `Vmo` pages.
-  - Exposes a Linux-compatible `/dev/kcov` character device (`KCOV_INIT_TRACE`, `KCOV_ENABLE`, `KCOV_DISABLE`, `mmap`) in `aster_core` and `/proc/kallsyms` (`_stext`, `_etext`) for `syz-manager` symbolization.
+  - Exposes a Linux-compatible `/dev/kcov` character device (`KCOV_INIT_TRACE`, `KCOV_ENABLE`, `KCOV_DISABLE`, `mmap`) in `aster_core` / `aster_kernel` and `/proc/kallsyms` (`_stext`, `_etext`) for `syz-manager` symbolization.
 - **Syzkaller Adaptations for Asterinas (`patch/syzkaller/`)**:
   - `0001`: Adds `open_kcov()` in `syz-executor` to fall back from `/sys/kernel/debug/kcov` to `/dev/kcov` on `ENOENT`, and relaxes optional netfilter/netns checks unsupported by Asterinas.
   - `0002`: Extends `pkg/cover/backend` and `pkg/vminfo` to fall back to `__stext` when `_stext` is absent and tolerate missing `/proc/kallsyms` when `cover: false`.
@@ -148,15 +148,11 @@ make syzkaller
 
 ### Prepare and Patch Asterinas Kernel
 
-Use `scripts/update-kernel.sh` to clone Asterinas, check out the target version (`v0.19.0` or `v0.18.1`), and apply the corresponding SyzAster patches:
+Use `scripts/update-kernel.sh` to clone Asterinas, check out the target version (`v0.19.0`, `v0.18.1`, `v0.18.0`, `v0.17.2`, or `v0.17.1`), and apply the corresponding SyzAster patches:
 ```bash
-# For Asterinas v0.19.0:
+# For Asterinas v0.19.0 (or v0.18.1 / v0.18.0 / v0.17.2 / v0.17.1):
 export ASTERINAS=/vol/asterinas-v0.19.0
 $SYZASTER/scripts/update-kernel.sh -d /vol -v v0.19.0
-
-# Or for Asterinas v0.18.1:
-export ASTERINAS=/vol/asterinas-v0.18.1
-$SYZASTER/scripts/update-kernel.sh -d /vol -v v0.18.1
 ```
 
 Or apply the patches manually to an existing Asterinas checkout:
@@ -168,6 +164,18 @@ git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.19.0/*.patch
 # For Asterinas v0.18.1 (commit d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5):
 git -C $ASTERINAS checkout --detach d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5
 git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.18.1/*.patch
+
+# For Asterinas v0.18.0 (commit 253be4750d69810af7b7b020fe2fee40a8547e15):
+git -C $ASTERINAS checkout --detach 253be4750d69810af7b7b020fe2fee40a8547e15
+git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.18.0/*.patch
+
+# For Asterinas v0.17.2 (commit 23adfdfd72b05cee8d232809caea81a4b33d3488):
+git -C $ASTERINAS checkout --detach 23adfdfd72b05cee8d232809caea81a4b33d3488
+git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.17.2/*.patch
+
+# For Asterinas v0.17.1 (commit 9ea44ed2b60bc81a5efb18af79e41fc07bf3d523):
+git -C $ASTERINAS checkout --detach 9ea44ed2b60bc81a5efb18af79e41fc07bf3d523
+git -C $ASTERINAS apply $SYZASTER/patch/asterinas/v0.17.1/*.patch
 ```
 
 Before building the full kernel, verify that the Rust compiler and `kcov-rustc` wrapper emit `__sanitizer_cov_trace_pc` callbacks for `aster_core` while leaving `ostd` uninstrumented:
@@ -266,7 +274,7 @@ Then start continuous coverage-guided fuzzing:
 
 ### Subsystem-Targeted Fuzzing
 
-SyzAster provides pre-configured syscall profiles under [`configs/fuzz/asterinas/`](configs/fuzz/asterinas/) for targeting specific Asterinas subsystems (`fs`, `net`, `process`, `mm`) as well as an uninstrumented baseline (`nocover.cfg`). You can merge the base config with any subsystem profile using `jq`:
+SyzAster provides pre-configured syscall profiles under [`configs/fuzz/asterinas/`](configs/fuzz/asterinas/) for targeting specific Asterinas subsystems (`fs`, `net`, `process`, `mm`). For an uninstrumented (`KCOV=0`) baseline, set `"cover": false` in `kernel.cfg` and drop `kernel_obj`, `kernel_src` and `kernel_build_src`. You can merge the base config with any subsystem profile using `jq`:
 ```bash
 jq -s 'add' ./.workdir/fuzz.cfg configs/fuzz/asterinas/fs.cfg > ./.workdir/fs-fuzz.cfg
 ./syzkaller/bin/syz-manager -config=./.workdir/fs-fuzz.cfg
@@ -328,6 +336,7 @@ All core verification, compiler-wrapping, and statistical evaluation tools are w
   ```bash
   ./scripts/update-kernel.sh -d /vol
   ```
+  Use `-o <SOURCE_DIR>` instead of `-d` to place the tree at an exact path (this is what the TUI uses for its Kernel Source Tree field).
 - **`scripts/asterinas/create-image.sh`**: Builds the Asterinas NixOS VM image, SSH keypair, and staged `kernel/vmlinux`.
 - **`scripts/asterinas/qemu.sh`**: Boots an Asterinas NixOS image in QEMU with OVMF and SSH port forwarding:
   ```bash
