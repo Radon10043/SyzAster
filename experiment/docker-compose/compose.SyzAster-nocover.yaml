@@ -43,7 +43,11 @@ services:
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
-        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/nocover.cfg" > "$$WORKDIR/fuzz.cfg"
+        # Uninstrumented baseline: kernel.cfg with coverage off. The image has
+        # no kernel/vmlinux, so the kernel object / source dirs are dropped.
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" \
+          | jq '.cover = false | .name += "-nocover" | .tag += "-nocover" | del(.kernel_obj, .kernel_src, .kernel_build_src)' \
+          > "$$WORKDIR/fuzz.cfg"
         timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
 
   asterinas-v0.18.1-kernel:
@@ -63,5 +67,81 @@ services:
         export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
         export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
         mkdir -p "$$WORKDIR"
-        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/nocover.cfg" > "$$WORKDIR/fuzz.cfg"
+        # Uninstrumented baseline: kernel.cfg with coverage off. The image has
+        # no kernel/vmlinux, so the kernel object / source dirs are dropped.
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" \
+          | jq '.cover = false | .name += "-nocover" | .tag += "-nocover" | del(.kernel_obj, .kernel_src, .kernel_build_src)' \
+          > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+  asterinas-v0.18.0-kernel:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/v0.18.0
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.18.0-nocover
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.18.0"
+      SUBSYSTEM: kernel
+    command:
+      - bash
+      - -ceu
+      - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        # Uninstrumented baseline: kernel.cfg with coverage off. The image has
+        # no kernel/vmlinux, so the kernel object / source dirs are dropped.
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" \
+          | jq '.cover = false | .name += "-nocover" | .tag += "-nocover" | del(.kernel_obj, .kernel_src, .kernel_build_src)' \
+          > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+  asterinas-v0.17.2-kernel:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/v0.17.2
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.17.2-nocover
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.17.2"
+      SUBSYSTEM: kernel
+    command:
+      - bash
+      - -ceu
+      - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        # Uninstrumented baseline: kernel.cfg with coverage off. The image has
+        # no kernel/vmlinux, so the kernel object / source dirs are dropped.
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" \
+          | jq '.cover = false | .name += "-nocover" | .tag += "-nocover" | del(.kernel_obj, .kernel_src, .kernel_build_src)' \
+          > "$$WORKDIR/fuzz.cfg"
+        timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1
+
+  asterinas-v0.17.1-kernel:
+    <<: *base
+    environment:
+      <<: *env
+      KERNEL: ${EXPERIMENT_ROOT_CONTAINER}/kernel/asterinas/v0.17.1
+      IMAGE: ${EXPERIMENT_ROOT_CONTAINER}/image/asterinas/v0.17.1-nocover
+      KERNEL_NAME: asterinas
+      KERNEL_VERSION: "v0.17.1"
+      SUBSYSTEM: kernel
+    command:
+      - bash
+      - -ceu
+      - |
+        cp -a "$$SYZASTER/syzkaller" /syzkaller
+        export SUFFIX="$$(cat /proc/sys/kernel/random/uuid | cut -d- -f1)"
+        export WORKDIR="$$OUTROOT/$$KERNEL_NAME-$$KERNEL_VERSION-$$SUBSYSTEM/out-$$SUFFIX"
+        mkdir -p "$$WORKDIR"
+        # Uninstrumented baseline: kernel.cfg with coverage off. The image has
+        # no kernel/vmlinux, so the kernel object / source dirs are dropped.
+        perl -pe 's/__([a-zA-Z0-9_]+)__/$$ENV{$$1}/g' "$$SYZASTER/configs/fuzz/$$KERNEL_NAME/kernel.cfg" \
+          | jq '.cover = false | .name += "-nocover" | .tag += "-nocover" | del(.kernel_obj, .kernel_src, .kernel_build_src)' \
+          > "$$WORKDIR/fuzz.cfg"
         timeout -s KILL 24h "/syzkaller/bin/syz-manager" -config "$$WORKDIR/fuzz.cfg" -bench "$$WORKDIR/bench.log" > "$$WORKDIR/fuzz.log" 2>&1

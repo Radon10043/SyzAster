@@ -1,6 +1,6 @@
 # Setup `image/asterinas`
 
-Use `scripts/asterinas/create-image.sh` to build the KCOV-instrumented Asterinas kernel, generate the NixOS disk image with Dropbear SSH and stage-2 init, and stage the exact unstripped `vmlinux` ELF (`target/x86_64-unknown-none/debug/asterinas-osdk-bin`).
+Use `scripts/asterinas/create-image.sh` to build the KCOV-instrumented Asterinas kernel, generate the NixOS disk image with Dropbear SSH and stage-2 init, and stage the exact unstripped `vmlinux` ELF (`target/x86_64-unknown-none/debug/asterinas-osdk-bin` on `v0.18.1`+, or `target/x86_64-unknown-none/debug/aster-kernel-osdk-bin` on `v0.17.1`–`v0.18.0`).
 
 ## Coverage-Guided Image (`KCOV=1`) for `v0.18.1`
 

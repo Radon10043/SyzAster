@@ -5,7 +5,7 @@ This directory contains all instructions, configurations, Docker Compose orchest
 ## Directory Structure
 
 - [`docs/setup-env.md`](docs/setup-env.md): End-to-end experiment environment preparation.
-- [`docs/setup-kernel_asterinas.md`](docs/setup-kernel_asterinas.md): Building Asterinas `v0.18.1` with `KCOV=1` and `KCOV=0`.
+- [`docs/setup-kernel_asterinas.md`](docs/setup-kernel_asterinas.md): Building Asterinas (`v0.17.1`–`v0.19.0`) with `KCOV=1` and `KCOV=0`.
 - [`docs/setup-image_asterinas.md`](docs/setup-image_asterinas.md): Generating Asterinas NixOS VM images and validating KCOV ABI.
 - [`docs/setup-fuzzer_SyzAster.md`](docs/setup-fuzzer_SyzAster.md): Building SyzAster Rust tools and patched `syzkaller`.
 - [`docs/setup-env_file.md`](docs/setup-env_file.md): Configuring `compose.env` for container-based evaluation.

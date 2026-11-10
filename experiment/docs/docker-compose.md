@@ -24,7 +24,7 @@ docker compose --env-file ./compose.env \
     up asterinas-v0.18.1-fs --scale asterinas-v0.18.1-fs=5 -d
 ```
 
-Launch the baseline uninstrumented (`KCOV=0`) ablation campaign with `compose.SyzAster-nocover.yaml`:
+Launch the baseline uninstrumented (`KCOV=0`) ablation campaign with `compose.SyzAster-nocover.yaml` (it derives `fuzz.cfg` from `kernel.cfg` with `"cover": false`):
 ```bash
 docker compose --env-file ./compose.env \
     -f ./experiment/docker-compose/compose.SyzAster-nocover.yaml \
