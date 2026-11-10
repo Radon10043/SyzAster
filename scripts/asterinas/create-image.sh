@@ -166,6 +166,15 @@ if [[ "${ALLOW_VERSION_MISMATCH}" -eq 0 ]]; then
 	require_cmd git
 	release_commit=""
 	case "${ASTERINAS_VERSION}" in
+	"0.17.1")
+		release_commit="9ea44ed2b60bc81a5efb18af79e41fc07bf3d523"
+		;;
+	"0.17.2")
+		release_commit="23adfdfd72b05cee8d232809caea81a4b33d3488"
+		;;
+	"0.18.0")
+		release_commit="253be4750d69810af7b7b020fe2fee40a8547e15"
+		;;
 	"0.18.1")
 		release_commit="d924a9635a66c7c3bb43e563eaafa2c61d6ee9d5"
 		;;
@@ -187,15 +196,32 @@ mkdir -p "${OUT_DIR}"
 SSH_KEY="${OUT_DIR}/asterinas.id_rsa"
 IMAGE="${OUT_DIR}/asterinas.img"
 
-# OSDK builds the generated asterinas-osdk-bin crate, then may strip or
+# OSDK builds the generated <kernel>-osdk-bin crate, then may strip or
 # transform its boot/bundle copy. Always use the original Cargo ELF instead.
-KERNEL_ELF="${ASTERINAS_DIR}/target/x86_64-unknown-none/debug/asterinas-osdk-bin"
+case "${actual_version}" in
+0.17.* | 0.18.0)
+	KERNEL_PKG_NAME="aster-kernel"
+	;;
+*)
+	KERNEL_PKG_NAME="asterinas"
+	;;
+esac
+KERNEL_BIN_NAME="${KERNEL_PKG_NAME}-osdk-bin"
+KERNEL_ELF="${ASTERINAS_DIR}/target/x86_64-unknown-none/debug/${KERNEL_BIN_NAME}"
 STAGED_KERNEL_OBJ="${OUT_DIR}/kernel"
 
 stage_kernel() {
 	if [[ ! -f "${KERNEL_ELF}" ]]; then
-		echo "coverage requested but matching unstripped kernel ELF is missing: ${KERNEL_ELF}. Build with KCOV=1 or use --no-cover for an uninstrumented image." >&2
-		exit 1
+		local alt_elf="${ASTERINAS_DIR}/target/x86_64-unknown-none/debug/asterinas-osdk-bin"
+		if [[ "${KERNEL_BIN_NAME}" != "aster-kernel-osdk-bin" ]]; then
+			alt_elf="${ASTERINAS_DIR}/target/x86_64-unknown-none/debug/aster-kernel-osdk-bin"
+		fi
+		if [[ -f "${alt_elf}" ]]; then
+			KERNEL_ELF="${alt_elf}"
+		else
+			echo "coverage requested but matching unstripped kernel ELF is missing: ${KERNEL_ELF}. Build with KCOV=1 or use --no-cover for an uninstrumented image." >&2
+			exit 1
+		fi
 	fi
 	require_cmd readelf
 	local sections
@@ -381,21 +407,24 @@ if [[ "${USE_PREBUILT_NIXOS_IMAGE}" -eq 1 ]]; then
 			CARGO_PROFILE_RELEASE_LTO=false
 		)
 	fi
+	kcmd_log_args=(--kcmd-args="loglevel=error" --kcmd-args="earlycon")
+	if [[ "${KERNEL_PKG_NAME}" == "aster-kernel" ]]; then
+		kcmd_log_args=(--kcmd-args="ostd.log_level=error")
+	fi
 	(
 		cd "${ASTERINAS_DIR}/kernel"
 		env "${kcov_env[@]}" \
 			OSDK_TARGET_ARCH=x86_64 \
 			CARGO_TARGET_DIR="${ASTERINAS_DIR}/target" \
 			"${OSDK_ROOT}/bin/cargo-osdk" build \
-			--kcmd-args="loglevel=error" \
-			--kcmd-args="earlycon" \
+			"${kcmd_log_args[@]}" \
 			--kcmd-args="console=ttyS0" \
 			--boot-method="qemu-direct" \
 			--grub-boot-protocol="linux" \
 			"${kcov_features[@]}"
 	)
 	rm -f "${ASTERINAS_DIR}/ostd/libs/linux-bzimage/setup/Cargo.lock"
-	bzimage="${ASTERINAS_DIR}/target/osdk/asterinas/asterinas-osdk-bin"
+	bzimage="${ASTERINAS_DIR}/target/osdk/${KERNEL_PKG_NAME}/${KERNEL_BIN_NAME}"
 	if [[ ! -f "${bzimage}" ]]; then
 		echo "Asterinas kernel build did not produce ${bzimage}" >&2
 		exit 1
@@ -409,7 +438,7 @@ if [[ "${USE_PREBUILT_NIXOS_IMAGE}" -eq 1 ]]; then
 	}
 	trap cleanup_mnt EXIT
 	mount -o loop,offset=1048576,sizelimit=510656512 "${IMAGE}" "${mnt_dir}"
-	for f in "${mnt_dir}"/kernels/*-asterinas-osdk-bin; do
+	for f in "${mnt_dir}"/kernels/*-asterinas-osdk-bin "${mnt_dir}"/kernels/*-aster-kernel-osdk-bin; do
 		if [[ -f "${f}" ]]; then
 			cp -f "${bzimage}" "${f}"
 		fi
@@ -418,7 +447,7 @@ if [[ "${USE_PREBUILT_NIXOS_IMAGE}" -eq 1 ]]; then
 	umount "${mnt_dir}"
 
 	mount -o loop,offset=511705088 "${IMAGE}" "${mnt_dir}"
-	for d in "${mnt_dir}"/nix/store/*-asterinas-osdk-bin; do
+	for d in "${mnt_dir}"/nix/store/*-asterinas-osdk-bin "${mnt_dir}"/nix/store/*-aster-kernel-osdk-bin; do
 		if [[ -d "${d}" && -f "${d}/bzImage" ]]; then
 			cp -f "${bzimage}" "${d}/bzImage"
 		fi
