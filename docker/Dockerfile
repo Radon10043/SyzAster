@@ -66,7 +66,7 @@ RUN wget -q --show-progress --progress=bar:force:noscroll https://github.com/llv
     tar -C /llvm-19 -xf LLVM-19.1.7-Linux-X64.tar.xz --strip-components=1 && \
     rm LLVM-19.1.7-Linux-X64.tar.xz
 
-# Install Rust toolchain (pinned to Asterinas rust-toolchain.toml) and SyzAster dependencies
+# Install Rust toolchains (pinned to Asterinas rust-toolchain.toml versions) and SyzAster dependencies
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- --default-toolchain ${ASTER_RUST_VERSION} -y && \
     rustup component add rust-src rustc-dev llvm-tools-preview && \
@@ -75,6 +75,11 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
         riscv64imac-unknown-none-elf \
         loongarch64-unknown-none-softfloat \
         aarch64-unknown-none-softfloat && \
+    for tc in nightly-2026-04-03 nightly-2025-12-06; do \
+        rustup toolchain install "$tc" --profile minimal \
+            --component rust-src --component rustc-dev --component llvm-tools-preview \
+            --target x86_64-unknown-none; \
+    done && \
     cargo install --locked cargo-binutils && \
     rm -rf /root/.cargo/registry /root/.cargo/git
 
@@ -100,6 +105,27 @@ RUN apt-get install -y miktex
 RUN miktexsetup --shared=yes finish && \
     initexmf --admin --set-config-value "[MPM]AutoInstall=1" && \
     mpm --admin --install=elegantpaper
+
+# Install MiKTeX packages for building presentation slides (slides/), resolved
+# from slides.fls, the fonts in slides.log and the xelatex format build log
+RUN miktex --admin packages require \
+        ltxbase l3kernel l3packages latex-tools latex-firstaid tex-ini-files \
+        unicode-data babel
+RUN miktex --admin packages require \
+        cm lm amsfonts amscls amsmath fontspec fira fontawesome5 zapfding
+RUN miktex --admin packages require \
+        ctex xecjk cjk zhnumber koma-script
+RUN miktex --admin packages require \
+        beamer moloch pgf pgfopts sansmathaccent translator geometry \
+        hyperref url
+RUN miktex --admin packages require \
+        tcolorbox tikzfill environ trimspaces listings booktabs qrcode xcolor \
+        graphics graphics-cfg graphics-def
+RUN miktex --admin packages require \
+        atbegshi bigintcalc bitset etoolbox gettitlestring hycolor iftex \
+        infwarerr intcalc kvdefinekeys kvoptions kvsetkeys ltxcmds pdfcol \
+        pdfescape pdftexcmds refcount rerunfilecheck stringenc uniquecounter \
+        xkeyval
 
 # Install draw.io desktop, Xvfb, and diagram fonts for exporting report figures (images/*.drawio -> PDF)
 ARG DRAWIO_VERSION=32.6.1
