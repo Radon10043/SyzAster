@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn print_kcov_usage(prog: &str) {
-    eprintln!("Usage: {} ASTERINAS_SOURCE SSH_PRIVATE_KEY SSH_PORT [SSH_HOST]", prog);
+    eprintln!(
+        "Usage: {} ASTERINAS_SOURCE SSH_PRIVATE_KEY SSH_PORT [SSH_HOST]",
+        prog
+    );
     eprintln!("Build and run the KCOV ABI test in an already booted, trusted test VM.");
 }
 
@@ -280,7 +283,9 @@ pub fn run_kcov_rustc(args: &[String]) -> Result<(), i32> {
 
     let mut cmd = Command::new(rustc);
     cmd.args(rest);
-    if crate_name == Some("aster_core") && target == Some("x86_64-unknown-none") {
+    if matches!(crate_name, Some("aster_core" | "aster_kernel"))
+        && target == Some("x86_64-unknown-none")
+    {
         cmd.args([
             "-C",
             "passes=sancov-module",
@@ -376,7 +381,25 @@ pub extern \"C\" fn branch(x: usize) -> usize {\n\
             }
         });
 
-    for krate in ["aster_core", "ostd"] {
+    let safe_crates: &[&str] = match asterinas_dir.as_ref() {
+        Some(dir) => {
+            let wrapper_uses_aster_kernel = wrapper_script
+                .as_ref()
+                .and_then(|p| fs::read_to_string(p).ok())
+                .map(|s| s.contains("aster_kernel") && !s.contains("aster_core"))
+                .unwrap_or(false);
+            let is_legacy_layout = dir.join("kernel/Cargo.toml").is_file()
+                && !dir.join("kernel/core/Cargo.toml").is_file();
+            if wrapper_uses_aster_kernel || is_legacy_layout {
+                &["aster_kernel"]
+            } else {
+                &["aster_core"]
+            }
+        }
+        None => &["aster_core", "aster_kernel"],
+    };
+
+    for &krate in safe_crates.iter().chain(std::iter::once(&"ostd")) {
         let out_obj = work.path().join(format!("{}.o", krate));
         let compile_args = vec![
             rustc.clone(),
@@ -411,13 +434,23 @@ pub extern \"C\" fn branch(x: usize) -> usize {\n\
         }
     }
 
-    let aster_info = match inspect_elf(&work.path().join("aster_core.o")) {
-        Ok(i) => i,
-        Err(e) => {
-            eprintln!("FAIL: could not inspect aster_core.o: {}", e);
+    for &krate in safe_crates {
+        let obj_name = format!("{}.o", krate);
+        let aster_info = match inspect_elf(&work.path().join(&obj_name)) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("FAIL: could not inspect {}: {}", obj_name, e);
+                return Err(1);
+            }
+        };
+        if !aster_info.references_undefined_symbol("__sanitizer_cov_trace_pc") {
+            eprintln!(
+                "FAIL: {} does not contain __sanitizer_cov_trace_pc callbacks",
+                obj_name
+            );
             return Err(1);
         }
-    };
+    }
     let ostd_info = match inspect_elf(&work.path().join("ostd.o")) {
         Ok(i) => i,
         Err(e) => {
@@ -425,11 +458,6 @@ pub extern \"C\" fn branch(x: usize) -> usize {\n\
             return Err(1);
         }
     };
-
-    if !aster_info.references_undefined_symbol("__sanitizer_cov_trace_pc") {
-        eprintln!("FAIL: aster_core.o does not contain __sanitizer_cov_trace_pc callbacks");
-        return Err(1);
-    }
     if ostd_info.references_undefined_symbol("__sanitizer_cov_trace_pc") {
         eprintln!("FAIL: the coverage runtime would be instrumented");
         return Err(1);
