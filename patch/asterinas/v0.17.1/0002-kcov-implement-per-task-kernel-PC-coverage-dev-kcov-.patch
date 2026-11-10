@@ -1,0 +1,1025 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SyzAster Authors <syzaster@asterinas.org>
+Date: Sat, 31 Oct 2026 11:01:12 +0800
+Subject: [PATCH 2/2] kcov: implement per-task kernel PC coverage (/dev/kcov)
+ and /proc/kallsyms
+
+Implement per-task SanitizerCoverage trace-pc collection in ostd::kcov,
+expose /dev/kcov character device with KCOV_INIT_TRACE/ENABLE/DISABLE
+ioctls and shared VMO mmap, add /proc/kallsyms text boundary symbols,
+and add tools/kcov-rustc.sh to instrument only aster_kernel.
+---
+ Makefile                                  |  18 ++
+ kernel/Cargo.toml                         |   1 +
+ kernel/src/device/misc/kcov.rs            | 205 ++++++++++++++++++++++
+ kernel/src/device/misc/mod.rs             |   7 +-
+ kernel/src/device/registry/char.rs        |   2 +-
+ kernel/src/fs/file/file_handle.rs         |   8 +
+ kernel/src/fs/file/inode_handle.rs        |  15 ++
+ kernel/src/fs/fs_impls/procfs/kallsyms.rs |  36 ++++
+ kernel/src/fs/fs_impls/procfs/mod.rs      |   4 +
+ kernel/src/process/posix_thread/exit.rs   |   3 +
+ kernel/src/syscall/mmap.rs                |   2 +
+ kernel/src/vm/vmar/vmar_impls/map.rs      |   8 +-
+ osdk/src/base_crate/mod.rs                |   9 +-
+ osdk/src/base_crate/x86_64.ld.template    |   3 +
+ ostd/Cargo.toml                           |   1 +
+ ostd/src/kcov.rs                          | 205 ++++++++++++++++++++++
+ ostd/src/lib.rs                           |   2 +
+ ostd/src/task/mod.rs                      |   8 +
+ tools/kcov-rustc.sh                       |  25 +++
+ tools/kcov-smoke.c                        | 138 +++++++++++++++
+ tools/test-kcov-instrumentation.sh        |  27 +++
+ 21 files changed, 722 insertions(+), 5 deletions(-)
+ create mode 100644 kernel/src/device/misc/kcov.rs
+ create mode 100644 kernel/src/fs/fs_impls/procfs/kallsyms.rs
+ create mode 100644 ostd/src/kcov.rs
+ create mode 100755 tools/kcov-rustc.sh
+ create mode 100644 tools/kcov-smoke.c
+ create mode 100755 tools/test-kcov-instrumentation.sh
+
+diff --git a/Makefile b/Makefile
+index 2c28335b0..2c898e517 100644
+--- a/Makefile
++++ b/Makefile
+@@ -21,6 +21,7 @@ OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
+ FEATURES ?=
+ NO_DEFAULT_FEATURES ?= 0
+ COVERAGE ?= 0
++KCOV ?= 0
+ # Specify whether to build regression tests under `test/initramfs/src/apps`.
+ ENABLE_BASIC_TEST ?= false
+ # Specify the primary system console (supported: tty0, ttyS0, hvc0).
+@@ -161,6 +162,23 @@ ifeq ($(COVERAGE), 1)
+ CARGO_OSDK_COMMON_ARGS += --coverage
+ endif
+ 
++ifeq ($(KCOV), 1)
++ifneq ($(TARGET_ARCH), x86_64)
++$(error KCOV currently supports only x86_64)
++endif
++ifneq ($(RELEASE_LTO), 0)
++$(error KCOV does not support LTO)
++endif
++ifneq ($(strip $(RUSTC_WRAPPER)$(RUSTC_WORKSPACE_WRAPPER)),)
++$(error KCOV requires exclusive use of the Rust compiler wrapper)
++endif
++CARGO_OSDK_COMMON_ARGS += --features=kcov
++export RUSTC_WRAPPER := $(CURDIR)/tools/kcov-rustc.sh
++# Keep the uninstrumented OSTD runtime out of cross-crate LTO.
++export CARGO_PROFILE_DEV_LTO := false
++export CARGO_PROFILE_RELEASE_LTO := false
++endif
++
+ ifdef FEATURES
+ CARGO_OSDK_COMMON_ARGS += --features="$(FEATURES)"
+ endif
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 228b8c9c6..a548a3f42 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -78,6 +78,7 @@ loongArch64 = "0.2.5"
+ [features]
+ default = ["cvm_guest"]
+ coverage = ["ostd/coverage"]
++kcov = ["ostd/kcov"]
+ cvm_guest = ["dep:tdx-guest", "ostd/cvm_guest", "aster-virtio/cvm_guest"]
+ # By default we use the Sv48 address translation mode.
+ riscv_sv39_mode = ["ostd/riscv_sv39_mode"]
+diff --git a/kernel/src/device/misc/kcov.rs b/kernel/src/device/misc/kcov.rs
+new file mode 100644
+index 000000000..edd3aa994
+--- /dev/null
++++ b/kernel/src/device/misc/kcov.rs
+@@ -0,0 +1,205 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Per-task kernel PC coverage through `/dev/kcov`.
++
++use device_id::{DeviceId, MinorId};
++use ostd::kcov::KcovBuffer;
++
++use crate::{
++    device::{
++        Device, DeviceType,
++        registry::char::{self, MajorIdOwner},
++    },
++    events::IoEvents,
++    fs::{
++        file::{FileIo, Mappable, StatusFlags},
++        vfs::inode::InodeIo,
++    },
++    prelude::*,
++    process::{
++        posix_thread::AsPosixThread,
++        signal::{PollHandle, Pollable},
++    },
++    thread::Thread,
++    util::ioctl::RawIoctl,
++    vm::vmo::{Vmo, VmoCommitError, VmoOptions},
++};
++
++// Linux's 64-bit ABI. INIT_TRACE encodes _IOR('c', 1, unsigned long), but
++// takes the number of entries by value, not a pointer to an output value.
++const KCOV_INIT_TRACE: u32 = 0x8008_6301;
++const KCOV_ENABLE: u32 = 0x6364;
++const KCOV_DISABLE: u32 = 0x6365;
++const MAX_ENTRIES: usize = 1 << 20;
++
++struct KcovDevice {
++    // Keep ownership for as long as this device is registered.
++    major: MajorIdOwner,
++}
++
++impl Device for KcovDevice {
++    fn type_(&self) -> DeviceType {
++        DeviceType::Char
++    }
++
++    fn id(&self) -> DeviceId {
++        DeviceId::new(self.major.get(), MinorId::new(0))
++    }
++
++    fn devtmpfs_path(&self) -> Option<String> {
++        Some("kcov".into())
++    }
++
++    fn open(&self) -> Result<Box<dyn FileIo>> {
++        let thread = Thread::current().unwrap();
++        if !thread
++            .as_posix_thread()
++            .unwrap()
++            .credentials()
++            .euid()
++            .is_root()
++        {
++            return_errno_with_message!(Errno::EPERM, "KCOV is restricted to root");
++        }
++
++        Ok(Box::new(KcovFile {
++            buffer: Mutex::new(None),
++        }))
++    }
++}
++
++struct KcovFile {
++    buffer: Mutex<Option<(Arc<Vmo>, Arc<KcovBuffer>)>>,
++}
++
++impl KcovFile {
++    fn init_trace(&self, entries: usize) -> Result<()> {
++        if !(2..=MAX_ENTRIES).contains(&entries) {
++            return_errno_with_message!(Errno::EINVAL, "invalid KCOV buffer size");
++        }
++
++        let mut buffer = self.buffer.lock();
++        if buffer.is_some() {
++            return_errno_with_message!(Errno::EBUSY, "the KCOV buffer is already initialized");
++        }
++
++        // VmoOptions::new creates a nonresizable anonymous VMO. Eagerly commit
++        // zeroed, independently allocated pages before publishing the buffer.
++        let vmo = VmoOptions::new(entries * size_of::<u64>()).alloc()?;
++        let mut frames = Vec::with_capacity(vmo.size() / PAGE_SIZE);
++        for offset in (0..vmo.size()).step_by(PAGE_SIZE) {
++            let frame = match vmo.try_commit_page(offset) {
++                Ok(frame) => frame,
++                Err(VmoCommitError::Err(err)) => return Err(err),
++                Err(VmoCommitError::NeedIo(_)) => {
++                    // A fresh anonymous VMO has no backend pager.
++                    return_errno_with_message!(Errno::EIO, "anonymous KCOV page is not ready");
++                }
++            };
++            frames.push(frame);
++        }
++        let runtime_buffer = KcovBuffer::new(frames, entries)?;
++        *buffer = Some((vmo, runtime_buffer));
++        Ok(())
++    }
++}
++
++impl Pollable for KcovFile {
++    fn poll(&self, mask: IoEvents, _poller: Option<&mut PollHandle>) -> IoEvents {
++        mask & (IoEvents::IN | IoEvents::OUT)
++    }
++}
++
++impl InodeIo for KcovFile {
++    fn read_at(
++        &self,
++        _offset: usize,
++        _writer: &mut VmWriter,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "KCOV does not support reading");
++    }
++
++    fn write_at(
++        &self,
++        _offset: usize,
++        _reader: &mut VmReader,
++        _status_flags: StatusFlags,
++    ) -> Result<usize> {
++        return_errno_with_message!(Errno::EINVAL, "KCOV does not support writing");
++    }
++}
++
++impl FileIo for KcovFile {
++    fn check_seekable(&self) -> Result<()> {
++        return_errno_with_message!(Errno::ESPIPE, "KCOV does not support seeking");
++    }
++
++    fn is_offset_aware(&self) -> bool {
++        false
++    }
++
++    fn ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
++        match raw_ioctl.cmd() {
++            KCOV_INIT_TRACE => self.init_trace(raw_ioctl.arg())?,
++            KCOV_ENABLE | KCOV_DISABLE => {
++                // Only KCOV_TRACE_PC (mode zero) is supported. DISABLE also
++                // requires a zero argument. CMP and remote coverage are not
++                // supported.
++                if raw_ioctl.arg() != 0 {
++                    return_errno_with_message!(Errno::EINVAL, "unsupported KCOV mode or argument");
++                }
++                let buffer = self.buffer.lock();
++                let (_, runtime_buffer) = buffer.as_ref().ok_or_else(|| {
++                    Error::with_message(Errno::EINVAL, "the KCOV buffer is not initialized")
++                })?;
++                if raw_ioctl.cmd() == KCOV_ENABLE {
++                    if !runtime_buffer.enable() {
++                        return_errno_with_message!(
++                            Errno::EBUSY,
++                            "a KCOV session is already enabled"
++                        );
++                    }
++                } else if !runtime_buffer.disable() {
++                    return_errno_with_message!(
++                        Errno::EINVAL,
++                        "the caller does not own this KCOV session"
++                    );
++                }
++            }
++            _ => return_errno_with_message!(Errno::ENOTTY, "unsupported KCOV ioctl"),
++        }
++        Ok(0)
++    }
++
++    fn validate_mmap(&self, offset: usize, length: usize, is_shared: bool) -> Result<()> {
++        let buffer = self.buffer.lock();
++        let (vmo, _) = buffer.as_ref().ok_or_else(|| {
++            Error::with_message(Errno::EINVAL, "the KCOV buffer is not initialized")
++        })?;
++        if offset != 0 || length != vmo.size() || !is_shared {
++            return_errno_with_message!(
++                Errno::EINVAL,
++                "KCOV requires a complete shared mapping at offset zero"
++            );
++        }
++        Ok(())
++    }
++
++    fn mappable(&self) -> Result<Mappable> {
++        let buffer = self.buffer.lock();
++        let (vmo, _) = buffer.as_ref().ok_or_else(|| {
++            Error::with_message(Errno::EINVAL, "the KCOV buffer is not initialized")
++        })?;
++        // Shared mappings always fault the same committed VMO pages back in:
++        // MADV_DONTNEED removes only PTEs, not pages from this anonymous VMO.
++        Ok(Mappable::Vmo(vmo.clone()))
++    }
++}
++
++pub(super) fn init_in_first_kthread() {
++    let device = Arc::new(KcovDevice {
++        major: char::allocate_major().unwrap(),
++    });
++    char::register(device).unwrap();
++}
+diff --git a/kernel/src/device/misc/mod.rs b/kernel/src/device/misc/mod.rs
+index 61328c2ff..0d2733aaf 100644
+--- a/kernel/src/device/misc/mod.rs
++++ b/kernel/src/device/misc/mod.rs
+@@ -2,13 +2,15 @@
+ 
+ //! Misc devices.
+ //!
+-//! Character device with major number 10.
++//! Includes major-10 misc devices and dynamically allocated character devices.
+ 
+ use device_id::MajorId;
+ use spin::Once;
+ 
+ use super::registry::char::{MajorIdOwner, acquire_major};
+ 
++#[cfg(feature = "kcov")]
++mod kcov;
+ #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
+ pub mod tdxguest;
+ 
+@@ -17,6 +19,9 @@ static MISC_MAJOR: Once<MajorIdOwner> = Once::new();
+ pub(super) fn init_in_first_kthread() {
+     MISC_MAJOR.call_once(|| acquire_major(MajorId::new(10)).unwrap());
+ 
++    #[cfg(feature = "kcov")]
++    kcov::init_in_first_kthread();
++
+     #[cfg(target_arch = "x86_64")]
+     ostd::if_tdx_enabled!({
+         super::registry::char::register(tdxguest::TdxGuest::new()).unwrap();
+diff --git a/kernel/src/device/registry/char.rs b/kernel/src/device/registry/char.rs
+index e060cabc5..6c922cb7a 100644
+--- a/kernel/src/device/registry/char.rs
++++ b/kernel/src/device/registry/char.rs
+@@ -76,7 +76,7 @@ pub fn acquire_major(major: MajorId) -> Result<MajorIdOwner> {
+ ///
+ /// The returned `MajorIdOwner` object represents the ownership to the major ID.
+ /// Until the object is dropped, this major ID cannot be acquired via `acquire_major` or `allocate_major` again.
+-#[expect(dead_code)]
++#[cfg_attr(not(feature = "kcov"), expect(dead_code))]
+ pub fn allocate_major() -> Result<MajorIdOwner> {
+     let mut majors = MAJORS.lock();
+ 
+diff --git a/kernel/src/fs/file/file_handle.rs b/kernel/src/fs/file/file_handle.rs
+index 6ecf35ae4..02276f288 100644
+--- a/kernel/src/fs/file/file_handle.rs
++++ b/kernel/src/fs/file/file_handle.rs
+@@ -56,6 +56,14 @@ pub trait FileLike: Pollable + Send + Sync + Any {
+         return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported");
+     }
+ 
++    /// Validates file-specific constraints before creating a memory mapping.
++    ///
++    /// `length` is rounded up to a page boundary and `is_shared` includes
++    /// both `MAP_SHARED` and `MAP_SHARED_VALIDATE`.
++    fn validate_mmap(&self, offset: usize, length: usize, is_shared: bool) -> Result<()> {
++        Ok(())
++    }
++
+     /// Obtains the mappable object to map this file into the user address space.
+     ///
+     /// If this file has a corresponding mappable object of [`Mappable`],
+diff --git a/kernel/src/fs/file/inode_handle.rs b/kernel/src/fs/file/inode_handle.rs
+index 658266c1b..c373ed37f 100644
+--- a/kernel/src/fs/file/inode_handle.rs
++++ b/kernel/src/fs/file/inode_handle.rs
+@@ -337,6 +337,16 @@ impl FileLike for InodeHandle {
+         return_errno_with_message!(Errno::ENOTTY, "ioctl is not supported");
+     }
+ 
++    fn validate_mmap(&self, offset: usize, length: usize, is_shared: bool) -> Result<()> {
++        if self.rights.is_empty() {
++            return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
++        }
++        if let Some(ref file_io) = self.file_io {
++            file_io.validate_mmap(offset, length, is_shared)?;
++        }
++        Ok(())
++    }
++
+     fn mappable(&self) -> Result<Mappable> {
+         if self.rights.is_empty() {
+             return_errno_with_message!(Errno::EBADF, "the file is opened as a path");
+@@ -534,6 +544,11 @@ pub trait FileIo: Pollable + InodeIo + Any + Send + Sync + 'static {
+     /// In that case, the `seek()` operation will do nothing but succeed.
+     fn is_offset_aware(&self) -> bool;
+ 
++    // See `FileLike::validate_mmap`.
++    fn validate_mmap(&self, _offset: usize, _length: usize, _is_shared: bool) -> Result<()> {
++        Ok(())
++    }
++
+     // See `FileLike::mappable`.
+     fn mappable(&self) -> Result<Mappable> {
+         return_errno_with_message!(Errno::EINVAL, "the file is not mappable");
+diff --git a/kernel/src/fs/fs_impls/procfs/kallsyms.rs b/kernel/src/fs/fs_impls/procfs/kallsyms.rs
+new file mode 100644
+index 000000000..a0272a33d
+--- /dev/null
++++ b/kernel/src/fs/fs_impls/procfs/kallsyms.rs
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Text-boundary symbols for interpreting KCOV PCs in the matching kernel ELF.
++
++use aster_util::printer::VmPrinter;
++
++use crate::{
++    fs::{
++        file::mkmod,
++        procfs::template::{FileOps, ProcFileBuilder},
++        vfs::inode::Inode,
++    },
++    prelude::*,
++};
++
++pub(super) struct KallsymsFileOps;
++
++impl KallsymsFileOps {
++    pub(super) fn new_inode(parent: Weak<dyn Inode>) -> Arc<dyn Inode> {
++        // Coverage kernels expose addresses only to the root test executor.
++        ProcFileBuilder::new(Self, mkmod!(u+r))
++            .parent(parent)
++            .build()
++            .unwrap()
++    }
++}
++
++impl FileOps for KallsymsFileOps {
++    fn read_at(&self, offset: usize, writer: &mut VmWriter) -> Result<usize> {
++        let range = ostd::kcov::kernel_text_range();
++        let mut printer = VmPrinter::new_skip(writer, offset);
++        writeln!(printer, "{:016x} T _stext", range.start)?;
++        writeln!(printer, "{:016x} T _etext", range.end)?;
++        Ok(printer.bytes_written())
++    }
++}
+diff --git a/kernel/src/fs/fs_impls/procfs/mod.rs b/kernel/src/fs/fs_impls/procfs/mod.rs
+index a4331f1e1..1cf49870c 100644
+--- a/kernel/src/fs/fs_impls/procfs/mod.rs
++++ b/kernel/src/fs/fs_impls/procfs/mod.rs
+@@ -42,6 +42,8 @@ use crate::{
+ mod cmdline;
+ mod cpuinfo;
+ mod filesystems;
++#[cfg(feature = "kcov")]
++mod kallsyms;
+ mod loadavg;
+ mod meminfo;
+ mod mounts;
+@@ -161,6 +163,8 @@ impl RootDirOps {
+         ("cmdline", CmdLineFileOps::new_inode),
+         ("cpuinfo", CpuInfoFileOps::new_inode),
+         ("filesystems", FileSystemsFileOps::new_inode),
++        #[cfg(feature = "kcov")]
++        ("kallsyms", kallsyms::KallsymsFileOps::new_inode),
+         ("loadavg", LoadAvgFileOps::new_inode),
+         ("meminfo", MemInfoFileOps::new_inode),
+         ("mounts", MountsSymOps::new_inode),
+diff --git a/kernel/src/process/posix_thread/exit.rs b/kernel/src/process/posix_thread/exit.rs
+index 936d42e40..e5a02a7aa 100644
+--- a/kernel/src/process/posix_thread/exit.rs
++++ b/kernel/src/process/posix_thread/exit.rs
+@@ -80,6 +80,9 @@ fn exit_internal(term_status: TermStatus, is_exiting_group: bool) {
+         thread_table::remove_thread(posix_thread.tid());
+     }
+ 
++    #[cfg(feature = "kcov")]
++    ostd::kcov::disable_current();
++
+     // Drop fields in `PosixThread`.
+     *posix_thread.file_table().lock() = None;
+     *posix_thread.ns_proxy().lock() = None;
+diff --git a/kernel/src/syscall/mmap.rs b/kernel/src/syscall/mmap.rs
+index b83f6bd47..bbbcc8fb8 100644
+--- a/kernel/src/syscall/mmap.rs
++++ b/kernel/src/syscall/mmap.rs
+@@ -122,6 +122,8 @@ fn do_sys_mmap(
+                 vm_may_perms.remove(VmPerms::MAY_WRITE);
+             }
+ 
++            file.validate_mmap(offset, len, option.typ().is_shared())?;
++
+             options = options
+                 .may_perms(vm_may_perms)
+                 .mappable(file.as_ref().as_ref())?
+diff --git a/kernel/src/vm/vmar/vmar_impls/map.rs b/kernel/src/vm/vmar/vmar_impls/map.rs
+index 7b266e7e5..7a2495bad 100644
+--- a/kernel/src/vm/vmar/vmar_impls/map.rs
++++ b/kernel/src/vm/vmar/vmar_impls/map.rs
+@@ -5,7 +5,7 @@ use core::num::NonZeroUsize;
+ use super::{MappedMemory, MappedVmo, RssDelta, VmMapping, Vmar};
+ use crate::{
+     fs::{
+-        file::{FileLike, Mappable},
++        file::{FileLike, InodeType, Mappable},
+         ramfs::memfd::MemfdInode,
+         vfs::path::Path,
+     },
+@@ -326,7 +326,11 @@ impl<'a> VmarMapOptions<'a> {
+         let (mapped_mem, io_mem) = match mappable {
+             Some(Mappable::Vmo(vmo)) => {
+                 if let Some(ref path) = path {
+-                    debug_assert!(Arc::ptr_eq(&vmo, &path.inode().page_cache().unwrap()));
++                    let inode = path.inode();
++                    debug_assert!(match inode.page_cache() {
++                        Some(page_cache) => Arc::ptr_eq(&vmo, &page_cache),
++                        None => inode.type_() == InodeType::CharDevice,
++                    });
+                 }
+ 
+                 let is_writable_tracked = if let Some(ref path) = path
+diff --git a/osdk/src/base_crate/mod.rs b/osdk/src/base_crate/mod.rs
+index 2ee68cd5f..60b2fbcce 100644
+--- a/osdk/src/base_crate/mod.rs
++++ b/osdk/src/base_crate/mod.rs
+@@ -96,8 +96,15 @@ pub fn new_base_crate(
+             &base_crate_path.join("src").join("main.rs"),
+             &base_crate_tmp_path.join("src").join("main.rs"),
+         );
++        let ld_result = are_files_identical(
++            &base_crate_path.join("x86_64.ld"),
++            &base_crate_tmp_path.join("x86_64.ld"),
++        );
+         std::fs::remove_dir_all(&base_crate_tmp_path).unwrap();
+-        if cargo_result.is_ok_and(|res| res) && main_rs_result.is_ok_and(|res| res) {
++        if cargo_result.is_ok_and(|res| res)
++            && main_rs_result.is_ok_and(|res| res)
++            && ld_result.is_ok_and(|res| res)
++        {
+             info!("Reusing existing base crate");
+             return base_crate_path;
+         }
+diff --git a/osdk/src/base_crate/x86_64.ld.template b/osdk/src/base_crate/x86_64.ld.template
+index 589937be2..a7f0d2014 100644
+--- a/osdk/src/base_crate/x86_64.ld.template
++++ b/osdk/src/base_crate/x86_64.ld.template
+@@ -86,7 +86,10 @@ SECTIONS
+     . = LOADADDR(.ap_boot) + SIZEOF(.ap_boot) + KERNEL_VMA;
+ 
+     .text                   : AT(ADDR(.text) - KERNEL_VMA) {
++        _stext = .;
++        __stext = .;
+         *(.text .text.*)
++        _etext = .;
+         PROVIDE(__etext = .);
+     } : text
+ 
+diff --git a/ostd/Cargo.toml b/ostd/Cargo.toml
+index 3362e4043..c6eb35b06 100644
+--- a/ostd/Cargo.toml
++++ b/ostd/Cargo.toml
+@@ -75,6 +75,7 @@ default = ["cvm_guest"]
+ # The guest OS support for Confidential VMs (CVMs), e.g., Intel TDX
+ cvm_guest = ["dep:tdx-guest", "dep:iced-x86"]
+ coverage = ["minicov"]
++kcov = []
+ riscv_sv39_mode = []
+ 
+ [lints]
+diff --git a/ostd/src/kcov.rs b/ostd/src/kcov.rs
+new file mode 100644
+index 000000000..c9fe7244c
+--- /dev/null
++++ b/ostd/src/kcov.rs
+@@ -0,0 +1,205 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! Task-scoped Linux KCOV recording for coverage-guided kernel testing.
++//!
++//! Only the safe kernel is instrumented. This runtime must remain uninstrumented,
++//! including when linking: coverage builds must disable cross-crate LTO.
++
++#[cfg(not(target_arch = "x86_64"))]
++compile_error!("KCOV currently supports only x86_64");
++
++use alloc::{sync::Arc, vec::Vec};
++use core::{
++    ops::Range,
++    sync::atomic::{AtomicBool, Ordering, compiler_fence},
++};
++
++use crate::{
++    Error, Result,
++    irq::InterruptLevel,
++    mm::{PAGE_SIZE, UFrame, VmIoOnce},
++    task::Task,
++};
++
++const WORD_SIZE: usize = size_of::<usize>();
++const WORDS_PER_PAGE: usize = PAGE_SIZE / WORD_SIZE;
++
++/// A fixed-size shared coverage area, with at most one task producing samples.
++#[derive(Debug)]
++pub struct KcovBuffer {
++    frames: Vec<UFrame>,
++    entries: usize,
++    active: AtomicBool,
++}
++
++impl KcovBuffer {
++    /// Creates a coverage area from retained, shared untyped frames.
++    ///
++    /// `entries` includes the first word holding the number of recorded PCs.
++    pub fn new(frames: Vec<UFrame>, entries: usize) -> Result<Arc<Self>> {
++        if entries < 2 || frames.len() != entries.div_ceil(WORDS_PER_PAGE) {
++            return Err(Error::InvalidArgs);
++        }
++        Ok(Arc::new(Self {
++            frames,
++            entries,
++            active: AtomicBool::new(false),
++        }))
++    }
++
++    /// Attaches the area to the calling task, unless either is already attached.
++    pub fn enable(self: &Arc<Self>) -> bool {
++        if !InterruptLevel::current().is_task_context() {
++            return false;
++        }
++        let Some(task) = Task::current() else {
++            return false;
++        };
++        let mut slot = task.kcov.lock();
++        if slot.is_some()
++            || self
++                .active
++                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
++                .is_err()
++        {
++            return false;
++        }
++        *slot = Some(Attachment(self.clone()));
++        true
++    }
++
++    /// Detaches the area if and only if the calling task owns it.
++    pub fn disable(&self) -> bool {
++        let Some(task) = Task::current() else {
++            return false;
++        };
++        let mut slot = task.kcov.lock();
++        if !slot
++            .as_ref()
++            .is_some_and(|attachment| core::ptr::eq(Arc::as_ptr(&attachment.0), self))
++        {
++            return false;
++        }
++        // Drop the attachment before releasing the task slot so that another
++        // task cannot observe a detached area still marked as active.
++        drop(slot.take());
++        true
++    }
++
++    fn record(&self, pc: usize) {
++        let Ok(count) = self.frames[0].read_once::<usize>(0) else {
++            return;
++        };
++        // The shared count is hostile input. Read it only once, and bound it
++        // before doing arithmetic or indexing any retained frame.
++        if count >= self.entries - 1 {
++            return;
++        }
++        let index = count + 1;
++        let frame = &self.frames[index / WORDS_PER_PAGE];
++        if frame
++            .write_once((index % WORDS_PER_PAGE) * WORD_SIZE, &pc)
++            .is_err()
++        {
++            return;
++        }
++        // x86_64 stores are ordered; prevent compiler reordering before
++        // publishing the new count. VmIoOnce tolerates racing userspace writes.
++        compiler_fence(Ordering::Release);
++        let _ = self.frames[0].write_once(0, &(count + 1));
++    }
++}
++
++#[derive(Debug)]
++pub(crate) struct Attachment(Arc<KcovBuffer>);
++
++impl Drop for Attachment {
++    fn drop(&mut self) {
++        self.0.active.store(false, Ordering::Release);
++    }
++}
++
++/// Detaches coverage on task exit, without requiring a surviving file descriptor.
++pub fn disable_current() {
++    if let Some(task) = Task::current() {
++        drop(task.kcov.lock().take());
++    }
++}
++
++/// Returns the linked text range used to interpret coverage PCs.
++pub fn kernel_text_range() -> Range<usize> {
++    unsafe extern "C" {
++        fn __stext();
++        fn __etext();
++    }
++    __stext as *const () as usize..__etext as *const () as usize
++}
++
++// SAFETY: The sanitizer ABI invokes this symbol as an ordinary SysV function.
++// Its return address is at [rsp]. Tail-jumping preserves the caller's stack
++// alignment and return address while passing that PC to the Rust dispatcher.
++#[unsafe(naked)]
++#[unsafe(no_mangle)]
++extern "C" fn __sanitizer_cov_trace_pc() {
++    core::arch::naked_asm!(
++        "mov rdi, [rsp]",
++        "jmp {}",
++        sym record_pc,
++    );
++}
++
++extern "C" fn record_pc(pc: usize) {
++    // CPU-local state is not usable before OSTD initialization.
++    if crate::IN_BOOTSTRAP_CONTEXT.load(Ordering::Relaxed)
++        || !InterruptLevel::current().is_task_context()
++    {
++        return;
++    }
++    let Some(task) = Task::current() else {
++        return;
++    };
++    // Never spin in a callback. A nested invocation while mutating an
++    // attachment is ignored, and IRQ handlers never contribute to task coverage.
++    let Some(slot) = task.kcov.try_lock() else {
++        return;
++    };
++    if let Some(attachment) = slot.as_ref() {
++        attachment.0.record(pc);
++    }
++}
++
++#[cfg(ktest)]
++mod test {
++    use super::*;
++    use crate::{mm::FrameAllocOptions, prelude::*};
++
++    #[ktest]
++    fn shared_count_is_bounded() {
++        let frame: UFrame = FrameAllocOptions::new().alloc_frame().unwrap().into();
++        let buffer = KcovBuffer::new(alloc::vec![frame.clone()], 3).unwrap();
++        buffer.record(0x1234);
++        assert_eq!(frame.read_once::<usize>(0).unwrap(), 1);
++        assert_eq!(frame.read_once::<usize>(WORD_SIZE).unwrap(), 0x1234);
++        buffer.record(0x5678);
++        buffer.record(0x9abc);
++        assert_eq!(frame.read_once::<usize>(0).unwrap(), 2);
++        frame.write_once(0, &usize::MAX).unwrap();
++        buffer.record(0xdead);
++        assert_eq!(frame.read_once::<usize>(0).unwrap(), usize::MAX);
++        frame.write_once(0, &0usize).unwrap();
++        buffer.record(0xbeef);
++        assert_eq!(frame.read_once::<usize>(WORD_SIZE).unwrap(), 0xbeef);
++    }
++
++    #[ktest]
++    fn records_across_page_boundary() {
++        let frames: Vec<UFrame> = (0..2)
++            .map(|_| FrameAllocOptions::new().alloc_frame().unwrap().into())
++            .collect();
++        frames[0].write_once(0, &(WORDS_PER_PAGE - 1)).unwrap();
++        let buffer = KcovBuffer::new(frames.clone(), WORDS_PER_PAGE + 1).unwrap();
++        buffer.record(0xcafe);
++        assert_eq!(frames[1].read_once::<usize>(0).unwrap(), 0xcafe);
++        assert_eq!(frames[0].read_once::<usize>(0).unwrap(), WORDS_PER_PAGE);
++    }
++}
+diff --git a/ostd/src/lib.rs b/ostd/src/lib.rs
+index 60b41bad6..0a150ea40 100644
+--- a/ostd/src/lib.rs
++++ b/ostd/src/lib.rs
+@@ -34,6 +34,8 @@ mod error;
+ mod ex_table;
+ pub mod io;
+ pub mod irq;
++#[cfg(feature = "kcov")]
++pub mod kcov;
+ pub mod logger;
+ pub mod mm;
+ pub mod panic;
+diff --git a/ostd/src/task/mod.rs b/ostd/src/task/mod.rs
+index 6cf899a24..1a9a2416c 100644
+--- a/ostd/src/task/mod.rs
++++ b/ostd/src/task/mod.rs
+@@ -67,6 +67,9 @@ pub struct Task {
+     switched_to_cpu: AtomicBool,
+ 
+     schedule_info: TaskScheduleInfo,
++
++    #[cfg(feature = "kcov")]
++    pub(crate) kcov: crate::sync::SpinLock<Option<crate::kcov::Attachment>>,
+ }
+ 
+ impl Task {
+@@ -187,6 +190,9 @@ impl TaskOptions {
+                 .expect("task function is `None` when trying to run");
+             task_func();
+ 
++            #[cfg(feature = "kcov")]
++            crate::kcov::disable_current();
++
+             // Manually drop all the on-stack variables to prevent memory leakage!
+             // This is needed because `scheduler::exit_current()` will never return.
+             //
+@@ -222,6 +228,8 @@ impl TaskOptions {
+                 cpu: AtomicCpuId::default(),
+             },
+             switched_to_cpu: AtomicBool::new(false),
++            #[cfg(feature = "kcov")]
++            kcov: crate::sync::SpinLock::new(None),
+         };
+ 
+         Ok(new_task)
+diff --git a/tools/kcov-rustc.sh b/tools/kcov-rustc.sh
+new file mode 100755
+index 000000000..958088401
+--- /dev/null
++++ b/tools/kcov-rustc.sh
+@@ -0,0 +1,25 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: MPL-2.0
++
++# Instrument only the safe syscall implementation crate. OSTD, the allocator,
++# and the compiler's host tools must never acquire sanitizer callbacks.
++set -euo pipefail
++rustc=$1
++shift
++args=("$@")
++crate_name=
++target=
++while (($#)); do
++    case "$1" in
++        --crate-name) crate_name=$2; shift 2 ;;
++        --target) target=$2; shift 2 ;;
++        *) shift ;;
++    esac
++done
++if [[ "$crate_name" == aster_kernel && "$target" == x86_64-unknown-none ]]; then
++    exec "$rustc" "${args[@]}" \
++        -C passes=sancov-module \
++        -C llvm-args=-sanitizer-coverage-level=3 \
++        -C llvm-args=-sanitizer-coverage-trace-pc
++fi
++exec "$rustc" "${args[@]}"
+diff --git a/tools/kcov-smoke.c b/tools/kcov-smoke.c
+new file mode 100644
+index 000000000..185fada85
+--- /dev/null
++++ b/tools/kcov-smoke.c
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: MPL-2.0
++
++// Build statically on the host, then execute as root in the instrumented guest:
++// gcc -O2 -Wall -Wextra -Werror -static -pthread tools/kcov-smoke.c -o kcov-smoke
++#define _GNU_SOURCE
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/ioctl.h>
++#include <sys/mman.h>
++#include <sys/syscall.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#define KCOV_INIT_TRACE _IOR('c', 1, unsigned long)
++#define KCOV_ENABLE _IO('c', 100)
++#define KCOV_DISABLE _IO('c', 101)
++#define ENTRIES (64UL << 10)
++#define REQUIRE(condition) \
++	do { \
++		if (!(condition)) { \
++			fprintf(stderr, "FAIL line %d: %s (errno=%d)\n", __LINE__, #condition, errno); \
++			exit(1); \
++		} \
++	} while (0)
++
++static void expect_error(int result, int error)
++{
++	REQUIRE(result == -1 && errno == error);
++}
++
++static void *other_thread(void *arg)
++{
++	int fd = *(int *)arg;
++	expect_error(ioctl(fd, KCOV_ENABLE, 0), EBUSY);
++	expect_error(ioctl(fd, KCOV_DISABLE, 0), EINVAL);
++	return NULL;
++}
++
++static unsigned long collect(volatile unsigned long *area, long nr)
++{
++	__atomic_store_n(&area[0], 0, __ATOMIC_RELAXED);
++	(void)syscall(nr);
++	unsigned long count = __atomic_load_n(&area[0], __ATOMIC_ACQUIRE);
++	REQUIRE(count > 0 && count < ENTRIES);
++	return count;
++}
++
++int main(void)
++{
++	int fd = open("/dev/kcov", O_RDWR | O_CLOEXEC);
++	if (fd < 0 && errno == ENOENT) {
++		fprintf(stderr, "SKIP: /dev/kcov is absent; build the guest with KCOV=1\n");
++		return 77;
++	}
++	REQUIRE(fd >= 0);
++	expect_error(ioctl(fd, KCOV_ENABLE, 0), EINVAL);
++	expect_error(ioctl(fd, KCOV_INIT_TRACE, 1), EINVAL);
++	expect_error(ioctl(fd, KCOV_INIT_TRACE, ULONG_MAX), EINVAL);
++	REQUIRE(ioctl(fd, KCOV_INIT_TRACE, ENTRIES) == 0);
++	expect_error(ioctl(fd, KCOV_INIT_TRACE, ENTRIES), EBUSY);
++	expect_error(ioctl(fd, KCOV_ENABLE, 1), EINVAL); // Comparison mode is not implemented.
++	REQUIRE(mmap(NULL, ENTRIES * sizeof(long), PROT_READ | PROT_WRITE,
++		     MAP_PRIVATE, fd, 0) == MAP_FAILED);
++	REQUIRE(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) == MAP_FAILED);
++	REQUIRE(mmap(NULL, ENTRIES * sizeof(long), PROT_READ | PROT_WRITE,
++		     MAP_SHARED, fd, 4096) == MAP_FAILED);
++	volatile unsigned long *area = mmap(NULL, ENTRIES * sizeof(long),
++		PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++	REQUIRE(area != MAP_FAILED);
++
++	unsigned long text_start = 0, text_end = 0;
++	FILE *symbols = fopen("/proc/kallsyms", "r");
++	REQUIRE(symbols != NULL);
++	char name[64], type;
++	unsigned long address;
++	while (fscanf(symbols, "%lx %c %63s", &address, &type, name) == 3) {
++		if (!__builtin_strcmp(name, "_stext"))
++			text_start = address;
++		if (!__builtin_strcmp(name, "_etext"))
++			text_end = address;
++	}
++	fclose(symbols);
++	REQUIRE(text_start != 0 && text_end > text_start);
++	REQUIRE(ioctl(fd, KCOV_ENABLE, 0) == 0);
++	expect_error(ioctl(fd, KCOV_ENABLE, 0), EBUSY);
++	unsigned long count = collect(area, SYS_getpid);
++	unsigned long first_pc = area[1];
++	for (unsigned long i = 1; i <= count; i++)
++		REQUIRE(area[i] >= text_start && area[i] < text_end);
++	unsigned long second_count = collect(area, SYS_getppid);
++
++	// A malicious shared count must never become an unchecked kernel index.
++	__atomic_store_n(&area[0], ULONG_MAX, __ATOMIC_RELAXED);
++	(void)syscall(SYS_getpid);
++	REQUIRE(__atomic_load_n(&area[0], __ATOMIC_RELAXED) == ULONG_MAX);
++	__atomic_store_n(&area[0], 0, __ATOMIC_RELAXED);
++
++	pthread_t thread;
++	REQUIRE(pthread_create(&thread, NULL, other_thread, &fd) == 0);
++	REQUIRE(pthread_join(thread, NULL) == 0);
++	pid_t child = fork();
++	REQUIRE(child >= 0);
++	if (child == 0) {
++		// An inherited FD is shared, but its tracing attachment is not inherited.
++		errno = 0;
++		if (ioctl(fd, KCOV_DISABLE, 0) != -1 || errno != EINVAL)
++			_exit(1);
++		errno = 0;
++		_exit(ioctl(fd, KCOV_ENABLE, 0) == -1 && errno == EBUSY ? 0 : 1);
++	}
++	int status;
++	REQUIRE(waitpid(child, &status, 0) == child);
++	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++	REQUIRE(ioctl(fd, KCOV_DISABLE, 0) == 0);
++	__atomic_store_n(&area[0], 0, __ATOMIC_RELAXED);
++	(void)syscall(SYS_getpid);
++	REQUIRE(area[0] == 0);
++
++	// Task exit releases ownership even when a different task retains the FD.
++	child = fork();
++	REQUIRE(child >= 0);
++	if (child == 0)
++		_exit(ioctl(fd, KCOV_ENABLE, 0) == 0 ? 0 : 1);
++	REQUIRE(waitpid(child, &status, 0) == child);
++	REQUIRE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
++	REQUIRE(ioctl(fd, KCOV_ENABLE, 0) == 0);
++	REQUIRE(ioctl(fd, KCOV_DISABLE, 0) == 0);
++	REQUIRE(munmap((void *)area, ENTRIES * sizeof(long)) == 0);
++	REQUIRE(close(fd) == 0);
++	printf("PASS: real KCOV PCs, getpid=%lu getppid=%lu first_pc=%#lx; bounds, mmap, ownership, fork and exit checked\n",
++	       count, second_count, first_pc);
++	return 0;
++}
+diff --git a/tools/test-kcov-instrumentation.sh b/tools/test-kcov-instrumentation.sh
+new file mode 100755
+index 000000000..9077cac10
+--- /dev/null
++++ b/tools/test-kcov-instrumentation.sh
+@@ -0,0 +1,27 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: MPL-2.0
++
++# Check the actual pinned compiler, not just the presence of build flags.
++set -euo pipefail
++root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
++work=$(mktemp -d)
++trap 'rm -rf "$work"' EXIT
++rustc=${RUSTC:-rustc}
++cat >"$work/probe.rs" <<'EOF'
++#![no_std]
++#[unsafe(no_mangle)]
++pub extern "C" fn branch(x: usize) -> usize {
++    if x > 7 { x / 3 } else { x + 9 }
++}
++EOF
++for crate in aster_kernel ostd; do
++    "$root/tools/kcov-rustc.sh" "$rustc" \
++        --crate-name "$crate" --crate-type lib --target x86_64-unknown-none \
++        --emit=obj -C opt-level=1 "$work/probe.rs" -o "$work/$crate.o"
++done
++nm -u "$work/aster_kernel.o" | grep -q __sanitizer_cov_trace_pc
++if nm -u "$work/ostd.o" | grep -q __sanitizer_cov_trace_pc; then
++    printf 'FAIL: the coverage runtime would be instrumented\n' >&2
++    exit 1
++fi
++printf 'PASS: safe kernel gets trace-pc callbacks; OSTD remains uninstrumented\n'
