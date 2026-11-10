@@ -125,16 +125,15 @@ impl KernelTab {
         self.dir.join("asterinas").join(self.version())
     }
 
+    /// Image output directory: `<dir>/image/asterinas/<version>` unless set.
     pub fn image_dir(&self) -> PathBuf {
         if let Some(p) = &self.image_override {
             return p.clone();
         }
-        let name = format!("asterinas-{}", self.version());
-        if Path::new("/vol/image").is_dir() {
-            PathBuf::from("/vol/image").join(name)
-        } else {
-            self.root.join(".workdir").join("image").join(name)
-        }
+        self.dir
+            .join("image")
+            .join("asterinas")
+            .join(self.version())
     }
 
     pub fn build_cfg(&self) -> PathBuf {
@@ -244,7 +243,7 @@ impl KernelTab {
             Item::new("image", ItemKind::Path, "Image output")
                 .icon(ic.folder)
                 .value(util::tilde(&self.image_dir()))
-                .help("Output directory of create-image.sh: asterinas.img, asterinas.id_rsa and the unstripped kernel/vmlinux used for symbolization."),
+                .help("Output directory of create-image.sh: asterinas.img, asterinas.id_rsa and the unstripped kernel/vmlinux used for symbolization. Defaults to <dir>/image/asterinas/<version>."),
             Item::new("kcov", ItemKind::Toggle, "KCOV instrumentation")
                 .icon(ic.radar)
                 .on(self.kcov)
