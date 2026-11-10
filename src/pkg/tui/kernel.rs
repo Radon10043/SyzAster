@@ -37,8 +37,12 @@ pub struct KernelTab {
 
 fn default_dir(root: &Path) -> PathBuf {
     if let Ok(a) = std::env::var("ASTERINAS") {
-        if let Some(parent) = Path::new(&a).parent() {
-            return parent.to_path_buf();
+        // $ASTERINAS follows the <dir>/asterinas/<version> layout.
+        let a = Path::new(&a);
+        if let Some(group) = a.parent().filter(|p| p.ends_with("asterinas")) {
+            if let Some(dir) = group.parent() {
+                return dir.to_path_buf();
+            }
         }
     }
     for cand in ["/vol/kernel", "/vol"] {
@@ -116,17 +120,9 @@ impl KernelTab {
         &self.versions[self.version]
     }
 
+    /// Kernel source tree: `<dir>/asterinas/<version>`.
     pub fn source_tree(&self) -> PathBuf {
-        if let Ok(a) = std::env::var("ASTERINAS") {
-            let p = PathBuf::from(a);
-            if p.parent() == Some(self.dir.as_path())
-                && p.file_name()
-                    .is_some_and(|n| n.to_string_lossy().ends_with(self.version()))
-            {
-                return p;
-            }
-        }
-        self.dir.join(format!("asterinas-{}", self.version()))
+        self.dir.join("asterinas").join(self.version())
     }
 
     pub fn image_dir(&self) -> PathBuf {
@@ -225,7 +221,7 @@ impl KernelTab {
                 .icon(ic.folder)
                 .value(util::tilde(&self.dir))
                 .badge(exists(&self.dir).filter(|_| !self.dir.exists()))
-                .help("Parent directory passed to scripts/update-kernel.sh -d. The kernel is cloned into <dir>/asterinas-<version>. Press Enter to change it."),
+                .help("Parent directory for kernel sources. The kernel is cloned into <dir>/asterinas/<version> (scripts/update-kernel.sh --dest). Press Enter to change it."),
             Item::new("src", ItemKind::Info, "Source tree")
                 .icon(ic.folder_open)
                 .value(util::tilde(&src))
@@ -373,9 +369,10 @@ impl KernelTab {
                 status(Level::Info, "Kernel status refreshed")
             }
             "download" => {
+                let src = self.source_tree();
                 let mut args = vec![
-                    "-d".to_string(),
-                    self.dir.display().to_string(),
+                    "--dest".to_string(),
+                    src.display().to_string(),
                     "-v".to_string(),
                     self.version().to_string(),
                 ];
@@ -389,7 +386,7 @@ impl KernelTab {
                     args,
                 );
                 job.after = After::Kernel;
-                job.mkdir = Some(self.dir.clone());
+                job.mkdir = src.parent().map(|p| p.to_path_buf());
                 job.inline = true;
                 let mut lines = vec![
                     vec![
@@ -398,7 +395,7 @@ impl KernelTab {
                         span(" into:", theme::BASE),
                     ],
                     vec![span(
-                        format!("  {}", util::tilde(&self.source_tree())),
+                        format!("  {}", util::tilde(&src)),
                         st(theme::CYAN),
                     )],
                     vec![],
