@@ -19,14 +19,14 @@ fn test_shell_scripts_csum_and_logs() {
 
     fs::write(
         c1.join("description"),
-        "asterinas panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE\n",
+        "panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE\n",
     )
     .unwrap();
     fs::write(c1.join("log0"), "crash log 0\n").unwrap();
 
     fs::write(
         c2.join("description"),
-        "asterinas panic: not implemented at src/syscall/timer_create.rs:LINE\n",
+        "panic: not implemented at src/syscall/timer_create.rs:LINE\n",
     )
     .unwrap();
     fs::write(c2.join("log0"), "crash log 0\n").unwrap();
@@ -49,7 +49,7 @@ fn test_shell_scripts_csum_and_logs() {
     let csv_text = fs::read_to_string(&csv_out).unwrap();
     assert!(csv_text.contains("status,title"));
     assert!(csv_text.contains(
-        "unknown,\"asterinas panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE\""
+        "unknown,\"panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE\""
     ));
 
     let interest = tmp.path().join("interest.txt");

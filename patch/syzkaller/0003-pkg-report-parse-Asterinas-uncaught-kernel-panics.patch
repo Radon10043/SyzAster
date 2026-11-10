@@ -41,7 +41,7 @@ index c0151799c..ea73f204d 100644
 +	if len(location) > 3 {
 +		location = location[len(location)-3:]
 +	}
-+	title := fmt.Sprintf("asterinas panic: %s at %s", reason, strings.Join(location, "/"))
++	title := fmt.Sprintf("panic: %s at %s", reason, strings.Join(location, "/"))
 +	rep := &Report{
 +		Title:    title,
 +		Type:     crash.TitleToType(title),
@@ -79,8 +79,8 @@ index 5bd698f9b..cc33c37b1 100644
 +			"Printing stack trace:\n  1: fn 0xffffffff88000000\n",
 +	}
 +	want := []string{
-+		"asterinas panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE",
-+		"asterinas panic: not implemented at src/syscall/timer_create.rs:LINE",
++		"panic: assertion failed: addr.is_unicast() at src/iface/route.rs:LINE",
++		"panic: not implemented at src/syscall/timer_create.rs:LINE",
 +	}
 +	for i, log := range logs {
 +		if !reporter.ContainsCrash([]byte(log)) {
