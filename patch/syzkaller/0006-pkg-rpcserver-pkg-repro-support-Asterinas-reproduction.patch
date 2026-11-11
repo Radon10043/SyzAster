@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: SyzAster Authors <syzaster@asterinas.org>
+Date: Wed, 11 Nov 2026 21:15:00 +0800
+Subject: [PATCH] pkg/rpcserver, pkg/repro: support Asterinas reproduction
+
+Asterinas kernel does not implement IN6ADDR_ANY / INADDR_ANY wildcard
+binding in its route lookup table, returning EADDRNOTAVAIL when
+syz-execprog binds its local FlatRPC server to ':0'. Change the local
+RPC bind address to explicit IPv4 loopback '127.0.0.1:0'.
+
+In addition, Asterinas userspace MachineCheck inside the guest takes
+approximately 22 seconds to probe features. Scale up the initial and
+subsequent replay timeouts in pkg/repro to 120s / 300s to avoid
+premature test timeouts during reproduction and minimization passes.
+---
+ pkg/repro/repro.go     | 9 +++++----
+ pkg/rpcserver/local.go | 2 +-
+ 2 files changed, 6 insertions(+), 5 deletions(-)
+
+diff --git a/pkg/repro/repro.go b/pkg/repro/repro.go
+index 4169f2b31..da3749d4b 100644
+--- a/pkg/repro/repro.go
++++ b/pkg/repro/repro.go
+@@ -116,8 +116,8 @@ func runInner(ctx context.Context, crashLog []byte, env Environment, exec execIn
+ 		crashExecutor = rep.Executor
+ 	}
+ 	testTimeouts := []time.Duration{
+-		max(30*time.Second, 3*cfg.Timeouts.Program), // to catch simpler crashes (i.e. no races and no hangs)
+-		max(100*time.Second, 20*cfg.Timeouts.Program),
++		max(120*time.Second, 10*cfg.Timeouts.Program), // to catch simpler crashes (i.e. no races and no hangs)
++		max(300*time.Second, 20*cfg.Timeouts.Program),
+ 		cfg.Timeouts.NoOutputRunningTime, // to catch "no output", races and hangs
+ 	}
+ 	switch {
+@@ -135,7 +135,7 @@ func runInner(ctx context.Context, crashLog []byte, env Environment, exec execIn
+ 		testTimeouts = testTimeouts[2:]
+ 	}
+ 	if env.Fast {
+-		testTimeouts = []time.Duration{30 * time.Second, 5 * time.Minute}
++		testTimeouts = []time.Duration{120 * time.Second, 5 * time.Minute}
+ 	}
+ 	reproCtx := &reproContext{
+ 		ctx:           ctx,
+@@ -529,7 +529,8 @@ func (ctx *reproContext) concatenateProgs(entries []*prog.LogEntry, dur time.Dur
+ }
+ 
+ func reproDuration(baseTimeout, crashedDuration, progTimeout time.Duration) time.Duration {
+-	return min(baseTimeout, max(progTimeout, crashedDuration)*2)
++	minBaseline := max(progTimeout, 60*time.Second)
++	return min(baseTimeout, max(minBaseline, crashedDuration)*2)
+ }
+ 
+ // Minimize calls and arguments.
+diff --git a/pkg/rpcserver/local.go b/pkg/rpcserver/local.go
+index cd72901c0..da586ae2f 100644
+--- a/pkg/rpcserver/local.go
++++ b/pkg/rpcserver/local.go
+@@ -71,7 +71,7 @@ func setupLocal(ctx context.Context, cfg *LocalConfig) (*local, context.Context,
+ 	}
+ 	cfg.UseCoverEdges = true
+ 	cfg.FilterSignal = true
+-	cfg.RPC = ":0"
++	cfg.RPC = "127.0.0.1:0"
+ 	cfg.PrintMachineCheck = log.V(1)
+ 	cfg.Stats = NewStats()
+ 	localCtx := &local{
+-- 
