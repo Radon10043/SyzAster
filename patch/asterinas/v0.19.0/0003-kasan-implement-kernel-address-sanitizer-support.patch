@@ -1,16 +1,21 @@
-From c4d8ce87530f37976b7295d8e43e872b33e6ef43 Mon Sep 17 00:00:00 2001
+From c9ade7e0bcfac50fa02ebde5e3ae273671b8b745 Mon Sep 17 00:00:00 2001
 From: Jiaming Zhang <772577952@qq.com>
 Date: Thu, 12 Nov 2026 15:53:41 +0800
 Subject: [PATCH] kasan: implement kernel address sanitizer support
 
 Add KASAN=1 error detection support for Asterinas v0.19.0.
 
-Implement boot-time 4-level zero-page shadow hierarchy in bsp_boot.S,
-dynamic shadow memory mapping in ostd::mm::kspace, comprehensive KASAN
-runtime ABI in ostd::kasan (loads/stores, memory intrinsics, reports,
-globals and noreturn handling) marked with #[sanitize(address = "off")],
-slab/heap allocator hooks in ostd::mm::heap to poison redzones and
-freed memory, and intrusive freelist traversal exemptions in slot_list.
+Implement boot-time 4-level zero-page shadow hierarchy in bsp_boot.S
+covering conventional RAM (PML4 472), frame metadata (PML4 496), and the
+kernel image (PML4 503), dynamic physical shadow mapping in
+ostd::mm::kspace, and comprehensive KASAN runtime ABI in ostd::kasan
+(loads/stores, memory intrinsics, reports, globals and noreturn handling)
+marked with #[sanitize(address = "off")].
+
+Provide slab/heap allocator hooks in ostd::mm::heap to poison redzones
+and freed memory, direct dereferencing exemptions in ostd::mm::heap::slot_list
+for intrusive free list operations, and physical frame unpoisoning on
+allocation in ostd::mm::frame::allocator.
 
 Update Makefile and tools/kcov-rustc.sh to support an independent 4-state
 matrix across KCOV and KASAN, maintaining zero-sancov in ostd and
@@ -20,18 +25,19 @@ applying -Cunsafe-allow-abi-mismatch=sanitizer across target crates.
  kernel/Cargo.toml                 |   1 +
  kernel/core/Cargo.toml            |   1 +
  ostd/Cargo.toml                   |   1 +
- ostd/src/arch/x86/boot/bsp_boot.S |  55 ++++++
- ostd/src/kasan.rs                 | 300 ++++++++++++++++++++++++++++++
+ ostd/src/arch/x86/boot/bsp_boot.S |  66 +++++++
+ ostd/src/kasan.rs                 | 315 ++++++++++++++++++++++++++++++
  ostd/src/lib.rs                   |   3 +
+ ostd/src/mm/frame/allocator.rs    |   6 +
  ostd/src/mm/heap/mod.rs           |  10 +-
- ostd/src/mm/heap/slot_list.rs     |   2 +
- ostd/src/mm/kspace/mod.rs         |  59 ++++++
+ ostd/src/mm/heap/slot_list.rs     |  15 +-
+ ostd/src/mm/kspace/mod.rs         |  95 ++++++++-
  tools/kcov-rustc.sh               |  79 +++++++-
- 11 files changed, 522 insertions(+), 12 deletions(-)
+ 12 files changed, 598 insertions(+), 17 deletions(-)
  create mode 100644 ostd/src/kasan.rs
 
 diff --git a/Makefile b/Makefile
-index d12ea8480..a0fa08319 100644
+index d12ea84..4e9d3b3 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -22,6 +22,8 @@ NO_DEFAULT_FEATURES ?= 0
@@ -75,7 +81,7 @@ index d12ea8480..a0fa08319 100644
  export CARGO_PROFILE_RELEASE_LTO := false
  endif
 diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
-index 01d5446bd..0ad4f512b 100644
+index 01d5446..0ad4f51 100644
 --- a/kernel/Cargo.toml
 +++ b/kernel/Cargo.toml
 @@ -21,6 +21,7 @@ aster-i8042.workspace = true
@@ -87,7 +93,7 @@ index 01d5446bd..0ad4f512b 100644
  pvh_boot = ["aster-core/pvh_boot"]
  riscv_sv39_mode = ["aster-core/riscv_sv39_mode"]
 diff --git a/kernel/core/Cargo.toml b/kernel/core/Cargo.toml
-index aa580be42..08c3c8b90 100644
+index aa580be..08c3c8b 100644
 --- a/kernel/core/Cargo.toml
 +++ b/kernel/core/Cargo.toml
 @@ -79,6 +79,7 @@ loongArch64.workspace = true
@@ -99,7 +105,7 @@ index aa580be42..08c3c8b90 100644
  pvh_boot = ["ostd/pvh_boot"]
  # By default we use the Sv48 address translation mode.
 diff --git a/ostd/Cargo.toml b/ostd/Cargo.toml
-index 54de6165f..2e1388e62 100644
+index 54de616..2e1388e 100644
 --- a/ostd/Cargo.toml
 +++ b/ostd/Cargo.toml
 @@ -75,6 +75,7 @@ default = ["cvm_guest"]
@@ -111,10 +117,10 @@ index 54de6165f..2e1388e62 100644
  riscv_sv39_mode = []
  
 diff --git a/ostd/src/arch/x86/boot/bsp_boot.S b/ostd/src/arch/x86/boot/bsp_boot.S
-index fe805476c..9ebee594a 100644
+index fe80547..6f6d584 100644
 --- a/ostd/src/arch/x86/boot/bsp_boot.S
 +++ b/ostd/src/arch/x86/boot/bsp_boot.S
-@@ -262,6 +262,48 @@ write_l2pt_entry_\bits:
+@@ -262,6 +262,59 @@ write_l2pt_entry_\bits:
      add edi, 8
      loop write_l2pt_entry_\bits
  
@@ -128,7 +134,7 @@ index fe805476c..9ebee594a 100644
 +    add edi, 8
 +    loop write_kasan_l1pt_\bits
 +
-+    // Setup KASAN early shadow L2PT: map all 512 entries to boot_kasan_l1pt
++    // Setup KASAN early shadow L2PT: map all 512 entries to boot_kasan_l1pt (covers 8GB RAM per L3 entry)
 +    lea edi, [boot_kasan_l2pt]
 +    lea eax, [boot_kasan_l1pt + (PTE_PRESENT | PTE_WRITE | PTE_GLOBAL)]
 +    mov ecx, 512
@@ -139,31 +145,42 @@ index fe805476c..9ebee594a 100644
 +    loop write_kasan_l2pt_\bits
 +
 +    // Setup KASAN early shadow L3PT:
-+    // Entry 0 covers shadow of linear map [0xffff8000_00000000, 0xffff8000_ffffffff]
++    // Entries 0..3 cover shadow of linear map [0xffff8000_00000000..] (covering 0..32GB RAM)
 +    lea edi, [boot_kasan_l3pt]
 +    lea eax, [boot_kasan_l2pt + (PTE_PRESENT | PTE_WRITE | PTE_GLOBAL)]
++    mov ecx, 4
++write_kasan_l3pt_ram_\bits:
 +    mov dword ptr [edi], eax
 +    mov dword ptr [edi + 4], 0
++    add edi, 8
++    loop write_kasan_l3pt_ram_\bits
 +
 +    // Entry 511 covers shadow of kernel image [0xffffffff_80000000, 0xffffffff_ffffffff]
 +    lea edi, [boot_kasan_l3pt + 511 * 8]
 +    mov dword ptr [edi], eax
 +    mov dword ptr [edi + 4], 0
 +
-+    // L4PT: Map KASAN shadow PML4 entries 472..503 (0xffff_ec00_0000_0000 .. 0xffff_fc00_0000_0000)
++    // L4PT: Map KASAN shadow PML4 entries:
++    // 472: linear map shadow
++    // 496: frame metadata shadow
++    // 503: kernel image shadow
 +    lea edi, [boot_l4pt + 472 * 8]
 +    lea eax, [boot_kasan_l3pt + (PTE_PRESENT | PTE_WRITE)]
-+    mov ecx, 32
-+write_kasan_l4pt_\bits:
 +    mov dword ptr [edi], eax
 +    mov dword ptr [edi + 4], 0
-+    add edi, 8
-+    loop write_kasan_l4pt_\bits
++
++    lea edi, [boot_l4pt + 496 * 8]
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
++
++    lea edi, [boot_l4pt + 503 * 8]
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
 +
      ret
  .endm
  
-@@ -310,6 +352,19 @@ boot_l2pt_2g_3g:
+@@ -310,6 +363,19 @@ boot_l2pt_2g_3g:
      .skip 4096
  boot_l2pt_3g_4g:
      .skip 4096
@@ -185,10 +202,10 @@ index fe805476c..9ebee594a 100644
  .code64
 diff --git a/ostd/src/kasan.rs b/ostd/src/kasan.rs
 new file mode 100644
-index 000000000..36caa6898
+index 0000000..ef8184b
 --- /dev/null
 +++ b/ostd/src/kasan.rs
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,315 @@
 +// SPDX-License-Identifier: MPL-2.0
 +
 +//! KernelAddressSanitizer (KASAN) runtime for Asterinas.
@@ -245,6 +262,14 @@ index 000000000..36caa6898
 +    shadow_addr as *mut i8
 +}
 +
++#[inline(never)]
++#[sanitize(address = "off")]
++fn is_monitored_addr(addr: usize) -> bool {
++    (addr >= 0xffff_8000_0000_0000 && addr < 0xffff_8100_0000_0000)
++        || (addr >= 0xffffe00000000000 && addr < 0xffffe01000000000)
++        || (addr >= 0xffffffff80000000)
++}
++
 +/// Checks whether an address range is accessible according to shadow memory.
 +#[inline(never)]
 +#[sanitize(address = "off")]
@@ -253,9 +278,16 @@ index 000000000..36caa6898
 +        return;
 +    }
 +
-+    // Filter out invalid/user addresses in kernel context
-+    if addr < 0xffff_8000_0000_0000 {
-+        report_error(addr, size, is_write, "user-or-null-ptr-deref", 0);
++    // Ignore addresses outside kernel higher-half space or within shadow memory itself
++    if addr < 0xffff_8000_0000_0000 || (addr >= KASAN_SHADOW_START && addr < KASAN_SHADOW_END) {
++        return;
++    }
++
++    if !is_monitored_addr(addr) {
++        return;
++    }
++
++    if addr.checked_add(size).is_none() {
 +        return;
 +    }
 +
@@ -292,7 +324,7 @@ index 000000000..36caa6898
 +/// Sets shadow bytes for a memory range to a poison value.
 +#[sanitize(address = "off")]
 +pub fn poison_range(addr: usize, size: usize, val: i8) {
-+    if size == 0 || addr < 0xffff_8000_0000_0000 {
++    if size == 0 || !is_monitored_addr(addr) {
 +        return;
 +    }
 +    let first_granule = addr >> SHADOW_SCALE;
@@ -307,7 +339,7 @@ index 000000000..36caa6898
 +/// Marks a memory range as unpoisoned (valid for access).
 +#[sanitize(address = "off")]
 +pub fn unpoison_range(addr: usize, size: usize) {
-+    if size == 0 || addr < 0xffff_8000_0000_0000 {
++    if size == 0 || !is_monitored_addr(addr) {
 +        return;
 +    }
 +    let mut p = addr;
@@ -490,7 +522,7 @@ index 000000000..36caa6898
 +#[sanitize(address = "off")]
 +pub extern "C" fn __asan_unregister_globals(_globals: usize, _n: usize) {}
 diff --git a/ostd/src/lib.rs b/ostd/src/lib.rs
-index 68e82827e..3f3b0d056 100644
+index 68e8282..3f3b0d0 100644
 --- a/ostd/src/lib.rs
 +++ b/ostd/src/lib.rs
 @@ -10,6 +10,7 @@
@@ -510,8 +542,32 @@ index 68e82827e..3f3b0d056 100644
  pub mod log;
  pub mod mm;
  pub mod panic;
+diff --git a/ostd/src/mm/frame/allocator.rs b/ostd/src/mm/frame/allocator.rs
+index 6137208..611d8f9 100644
+--- a/ostd/src/mm/frame/allocator.rs
++++ b/ostd/src/mm/frame/allocator.rs
+@@ -58,6 +58,9 @@ impl FrameAllocOptions {
+             .map(|paddr| Frame::from_unused(paddr, metadata).unwrap())
+             .ok_or(Error::NoMemory)?;
+ 
++        #[cfg(feature = "kasan")]
++        crate::kasan::unpoison_range(paddr_to_vaddr(frame.paddr()), PAGE_SIZE);
++
+         if self.zeroed {
+             let addr = paddr_to_vaddr(frame.paddr()) as *mut u8;
+             // SAFETY: The newly allocated frame is guaranteed to be valid.
+@@ -95,6 +98,9 @@ impl FrameAllocOptions {
+             })
+             .ok_or(Error::NoMemory)?;
+ 
++        #[cfg(feature = "kasan")]
++        crate::kasan::unpoison_range(paddr_to_vaddr(segment.paddr()), nframes * PAGE_SIZE);
++
+         if self.zeroed {
+             let addr = paddr_to_vaddr(segment.paddr()) as *mut u8;
+             // SAFETY: The newly allocated segment is guaranteed to be valid.
 diff --git a/ostd/src/mm/heap/mod.rs b/ostd/src/mm/heap/mod.rs
-index 58f15b90b..f7d3a1f59 100644
+index 58f15b9..f7d3a1f 100644
 --- a/ostd/src/mm/heap/mod.rs
 +++ b/ostd/src/mm/heap/mod.rs
 @@ -121,7 +121,12 @@ unsafe impl GlobalAlloc for AllocDispatch {
@@ -538,7 +594,7 @@ index 58f15b90b..f7d3a1f59 100644
      }
  }
 diff --git a/ostd/src/mm/heap/slot_list.rs b/ostd/src/mm/heap/slot_list.rs
-index 6eb56125c..6cf1fe694 100644
+index 6eb5612..6683a89 100644
 --- a/ostd/src/mm/heap/slot_list.rs
 +++ b/ostd/src/mm/heap/slot_list.rs
 @@ -43,6 +43,7 @@ impl<const SLOT_SIZE: usize> SlabSlotList<SLOT_SIZE> {
@@ -549,7 +605,20 @@ index 6eb56125c..6cf1fe694 100644
      pub fn push(&mut self, slot: HeapSlot) {
          let slot_ptr = slot.as_ptr();
          let super::SlotInfo::SlabSlot(slot_size) = slot.info() else {
-@@ -70,6 +71,7 @@ impl<const SLOT_SIZE: usize> SlabSlotList<SLOT_SIZE> {
+@@ -60,22 +61,25 @@ impl<const SLOT_SIZE: usize> SlabSlotList<SLOT_SIZE> {
+         // Write the original head to the slot.
+         // SAFETY: A heap slot must be free so the pointer to the slot can be
+         // written to. The slot size is at least the size of a pointer.
++        // Direct assignment is used to prevent compiler instrumentation from
++        // checking accesses to poisoned freed memory.
+         unsafe {
+-            slot_ptr
+-                .cast::<usize>()
+-                .write(original_head.map_or(0, |h| h.as_ptr() as usize));
++            *slot_ptr.cast::<usize>() = original_head.map_or(0, |h| h.as_ptr() as usize);
+         }
+     }
+ 
      /// Pops a slot from the front of the list.
      ///
      /// It returns `None` if the list is empty.
@@ -557,17 +626,48 @@ index 6eb56125c..6cf1fe694 100644
      pub fn pop(&mut self) -> Option<HeapSlot> {
          let original_head = self.head?;
  
+         // SAFETY: The head is a valid pointer to a free slot.
+         // The slot contains a pointer to the next slot.
+-        let next = unsafe { original_head.as_ptr().cast::<usize>().read() } as *mut u8;
++        // Direct assignment is used to prevent compiler instrumentation from
++        // checking accesses to poisoned freed memory.
++        let next = unsafe { *original_head.as_ptr().cast::<usize>() } as *mut u8;
+ 
+         self.head = if next.is_null() {
+             None
+@@ -84,6 +88,9 @@ impl<const SLOT_SIZE: usize> SlabSlotList<SLOT_SIZE> {
+             Some(unsafe { NonNull::new_unchecked(next) })
+         };
+ 
++        #[cfg(feature = "kasan")]
++        crate::kasan::unpoison_range(original_head.as_ptr() as usize, SLOT_SIZE);
++
+         Some(unsafe { HeapSlot::new(original_head, super::SlotInfo::SlabSlot(SLOT_SIZE)) })
+     }
+ }
 diff --git a/ostd/src/mm/kspace/mod.rs b/ostd/src/mm/kspace/mod.rs
-index 9955ed994..e6ee822ae 100644
+index 9955ed9..f83c29d 100644
 --- a/ostd/src/mm/kspace/mod.rs
 +++ b/ostd/src/mm/kspace/mod.rs
-@@ -301,9 +301,68 @@ pub(crate) fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
+@@ -251,9 +251,10 @@ pub(crate) fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
+     }
+ 
+     // Map the metadata pages.
++    let meta_size = meta_pages.size();
+     {
+         let start_va = mapping::frame_to_meta::<PagingConsts>(crate::mm::frame::min_paddr());
+-        let from = start_va..start_va + meta_pages.size();
++        let from = start_va..start_va + meta_size;
+         let prop = PageProperty {
+             flags: PageFlags::RW,
+             cache: CachePolicy::Writeback,
+@@ -301,9 +302,101 @@ pub(crate) fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
          }
      }
  
 +    #[cfg(feature = "kasan")]
 +    {
-+        init_kasan_shadow(&kpt, &preempt_guard);
++        init_kasan_shadow(&kpt, &preempt_guard, meta_size);
 +    }
 +
      KERNEL_PAGE_TABLE.call_once(|| kpt);
@@ -577,16 +677,13 @@ index 9955ed994..e6ee822ae 100644
 +fn init_kasan_shadow(
 +    kpt: &PageTable<KernelPtConfig>,
 +    preempt_guard: &crate::task::DisabledPreemptGuard,
++    meta_size: usize,
 +) {
 +    use align_ext::AlignExt;
++    use crate::boot::memory_region::MemoryRegionType;
 +    use crate::mm::FrameAllocOptions;
 +
 +    crate::info!("Initializing KASAN shadow memory mappings");
-+
-+    let max_paddr = crate::mm::frame::max_paddr();
-+    let shadow_ram_start = crate::kasan::KASAN_SHADOW_START;
-+    let shadow_ram_len = (max_paddr >> crate::kasan::SHADOW_SCALE).align_up(PAGE_SIZE);
-+    let shadow_ram_end = shadow_ram_start + shadow_ram_len;
 +
 +    let prop = PageProperty {
 +        flags: PageFlags::RW,
@@ -594,34 +691,70 @@ index 9955ed994..e6ee822ae 100644
 +        priv_flags: PrivilegedPageFlags::GLOBAL,
 +    };
 +
-+    const CHUNK_SIZE: usize = 2 * 1024 * 1024;
-+    let mut cur_va = shadow_ram_start;
-+    while cur_va < shadow_ram_end {
-+        let remaining = shadow_ram_end - cur_va;
-+        let chunk_len = core::cmp::min(CHUNK_SIZE, remaining);
++    let map_shadow_range = |shadow_start: usize, shadow_end: usize| {
++        const CHUNK_SIZE: usize = 2 * 1024 * 1024;
++        let mut cur_va = shadow_start;
++        while cur_va < shadow_end {
++            let next_2m = (cur_va + 1).align_up(CHUNK_SIZE);
++            let chunk_end = core::cmp::min(next_2m, shadow_end);
++            let chunk_len = chunk_end - cur_va;
 +
-+        let nframes = chunk_len / PAGE_SIZE;
-+        let seg = FrameAllocOptions::new()
-+            .zeroed(true)
-+            .alloc_segment(nframes);
++            let nframes = chunk_len / PAGE_SIZE;
++            let seg = FrameAllocOptions::new()
++                .zeroed(true)
++                .alloc_segment(nframes);
 +
-+        if let Ok(segment) = seg {
-+            let pa_range = segment.into_raw();
-+            let from = cur_va..cur_va + chunk_len;
-+            let min_level = max_page_level::<KernelPtConfig>(chunk_len);
-+            let mut cursor = kpt
-+                .cursor_mut_with_min_level(preempt_guard, &from, min_level)
-+                .unwrap();
-+            for (pa, level) in largest_pages::<KernelPtConfig>(from.start, pa_range.start, chunk_len) {
-+                // SAFETY: We are mapping the KASAN shadow memory for the kernel.
-+                unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
++            if let Ok(segment) = seg {
++                let pa_range = segment.into_raw();
++                let from = cur_va..chunk_end;
++                let min_level = max_page_level::<KernelPtConfig>(chunk_len);
++                let mut cursor = kpt
++                    .cursor_mut_with_min_level(preempt_guard, &from, min_level)
++                    .unwrap();
++                for (pa, level) in largest_pages::<KernelPtConfig>(from.start, pa_range.start, chunk_len) {
++                    // SAFETY: We are mapping the KASAN shadow memory for the kernel.
++                    unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
++                }
 +            }
++            cur_va = chunk_end;
 +        }
-+        cur_va += chunk_len;
++    };
++
++    // 1. Map shadow for linear mapping (physical RAM)
++    let max_paddr = crate::mm::frame::max_paddr();
++    let shadow_ram_start = crate::kasan::KASAN_SHADOW_START;
++    let shadow_ram_len = (max_paddr >> crate::kasan::SHADOW_SCALE).align_up(PAGE_SIZE);
++    let shadow_ram_end = shadow_ram_start + shadow_ram_len;
++    map_shadow_range(shadow_ram_start, shadow_ram_end);
++
++    // 2. Map shadow for kernel image (code, rodata, data, bss, boot stack)
++    let regions = &crate::boot::EARLY_INFO.get().unwrap().memory_regions;
++    if let Some(kregion) = regions.iter().find(|r| r.typ() == MemoryRegionType::Kernel) {
++        let offset = kernel_loaded_offset();
++        let kimg_start = kregion.base() + offset;
++        let kimg_end = kregion.end() + offset;
++        let kimg_shadow_start = ((kimg_start >> crate::kasan::SHADOW_SCALE)
++            .wrapping_add(crate::kasan::SHADOW_OFFSET))
++            .align_down(PAGE_SIZE);
++        let kimg_shadow_end = ((kimg_end >> crate::kasan::SHADOW_SCALE)
++            .wrapping_add(crate::kasan::SHADOW_OFFSET))
++            .align_up(PAGE_SIZE);
++        map_shadow_range(kimg_shadow_start, kimg_shadow_end);
 +    }
 +
++    // 3. Map shadow for frame metadata
++    let meta_start = mapping::frame_to_meta::<PagingConsts>(crate::mm::frame::min_paddr());
++    let meta_end = meta_start + meta_size;
++    let meta_shadow_start = ((meta_start >> crate::kasan::SHADOW_SCALE)
++        .wrapping_add(crate::kasan::SHADOW_OFFSET))
++        .align_down(PAGE_SIZE);
++    let meta_shadow_end = ((meta_end >> crate::kasan::SHADOW_SCALE)
++        .wrapping_add(crate::kasan::SHADOW_OFFSET))
++        .align_up(PAGE_SIZE);
++    map_shadow_range(meta_shadow_start, meta_shadow_end);
++
 +    crate::info!(
-+        "KASAN shadow mapping complete: [{:#x}, {:#x})",
++        "KASAN shadow mapping complete: RAM [{:#x}, {:#x})",
 +        shadow_ram_start,
 +        shadow_ram_end
 +    );
@@ -631,7 +764,7 @@ index 9955ed994..e6ee822ae 100644
  ///
  /// All address translation of symbols in the boot sections must be manually
 diff --git a/tools/kcov-rustc.sh b/tools/kcov-rustc.sh
-index 2d345bb40..4314ec2dc 100755
+index 2d345bb..4314ec2 100755
 --- a/tools/kcov-rustc.sh
 +++ b/tools/kcov-rustc.sh
 @@ -1,8 +1,14 @@
