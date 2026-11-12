@@ -19,6 +19,7 @@ ALLOW_VERSION_MISMATCH=0
 KEEP_NIX_CONFIG=0
 COVER=true
 KCOV=1
+KASAN=0
 
 usage() {
 	cat <<EOF
@@ -30,6 +31,8 @@ Options:
   --version VERSION            Required Asterinas VERSION (default: ${ASTERINAS_VERSION}).
   --disk-size-mb MB            Asterinas NixOS disk size (default: ${DISK_SIZE_MB}).
   --no-cover                   Build an uninstrumented image (KCOV=0) without staging vmlinux.
+  --kasan                      Build with KernelAddressSanitizer (KASAN=1).
+  --no-kasan                   Build without KASAN (default).
   --force                      Recreate the Asterinas target/nixos image.
   --allow-version-mismatch     Build even if VERSION or the release commit differs.
   --keep-nix-config            Keep the generated NixOS config in the Asterinas tree.
@@ -38,7 +41,7 @@ Options:
 The script writes:
   OUT/asterinas.img
   OUT/asterinas.id_rsa
-  OUT/kernel/vmlinux           Exact unstripped kernel ELF (unless --no-cover).
+  OUT/kernel/vmlinux           Exact unstripped kernel ELF (unless neither coverage nor KASAN).
 
 Coverage is enabled by default and requires the Asterinas KCOV patch.
 For syz-manager configuration templates, see configs/fuzz/asterinas/.
@@ -78,6 +81,14 @@ while (($#)); do
 	--no-cover)
 		COVER=false
 		KCOV=0
+		shift
+		;;
+	--kasan)
+		KASAN=1
+		shift
+		;;
+	--no-kasan)
+		KASAN=0
 		shift
 		;;
 	--force)
@@ -219,7 +230,7 @@ stage_kernel() {
 		if [[ -f "${alt_elf}" ]]; then
 			KERNEL_ELF="${alt_elf}"
 		else
-			echo "coverage requested but matching unstripped kernel ELF is missing: ${KERNEL_ELF}. Build with KCOV=1 or use --no-cover for an uninstrumented image." >&2
+			echo "staged kernel requested but matching unstripped kernel ELF is missing: ${KERNEL_ELF}. Build with KCOV=1/KASAN=1 or use --no-cover for an uninstrumented image." >&2
 			exit 1
 		fi
 	fi
@@ -227,14 +238,25 @@ stage_kernel() {
 	local sections
 	if ! sections=$(readelf -SW "${KERNEL_ELF}") ||
 		[[ "${sections}" != *".symtab"* || "${sections}" != *".debug_info"* ]]; then
-		echo "coverage requires an unstripped kernel ELF with debug info: ${KERNEL_ELF}" >&2
+		echo "staged kernel requires an unstripped kernel ELF with debug info: ${KERNEL_ELF}" >&2
 		exit 1
 	fi
 	local symbols
-	if ! symbols=$(readelf -sW "${KERNEL_ELF}") ||
-		! awk '$7 != "UND" && $8 == "__sanitizer_cov_trace_pc" { found = 1 } END { exit !found }' <<<"${symbols}"; then
-		echo "coverage requires a kernel ELF defining __sanitizer_cov_trace_pc: ${KERNEL_ELF}. Apply patch/asterinas/v${ASTERINAS_VERSION}/*.patch and build with KCOV=1." >&2
+	if ! symbols=$(readelf -sW "${KERNEL_ELF}"); then
+		echo "failed to inspect kernel symbols: ${KERNEL_ELF}" >&2
 		exit 1
+	fi
+	if [[ "${KCOV}" == "1" ]]; then
+		if ! awk '$7 != "UND" && $8 == "__sanitizer_cov_trace_pc" { found = 1 } END { exit !found }' <<<"${symbols}"; then
+			echo "coverage requires a kernel ELF defining __sanitizer_cov_trace_pc: ${KERNEL_ELF}. Apply patch/asterinas/v${ASTERINAS_VERSION}/*.patch and build with KCOV=1." >&2
+			exit 1
+		fi
+	fi
+	if [[ "${KASAN}" == "1" ]]; then
+		if ! awk '$7 != "UND" && $8 ~ /^__asan_/ { found = 1 } END { exit !found }' <<<"${symbols}"; then
+			echo "KASAN requires a kernel ELF defining __asan symbols: ${KERNEL_ELF}. Apply patch/asterinas/v${ASTERINAS_VERSION}/*.patch and build with KASAN=1." >&2
+			exit 1
+		fi
 	fi
 	mkdir -p "${STAGED_KERNEL_OBJ}"
 	if [[ ! "${KERNEL_ELF}" -ef "${STAGED_KERNEL_OBJ}/vmlinux" ]]; then
@@ -397,14 +419,21 @@ OSDK_ROOT="${OUT_DIR}/osdk"
 export PATH="${OSDK_ROOT}/bin:${PATH}"
 
 if [[ "${USE_PREBUILT_NIXOS_IMAGE}" -eq 1 ]]; then
-	kcov_features=()
-	kcov_env=()
+	build_features=()
 	if [[ "${KCOV}" == "1" ]]; then
-		kcov_features=(--features=kcov)
-		kcov_env=(
+		build_features+=(--features=kcov)
+	fi
+	if [[ "${KASAN}" == "1" ]]; then
+		build_features+=(--features=kasan)
+	fi
+	build_env=()
+	if [[ "${KCOV}" == "1" || "${KASAN}" == "1" ]]; then
+		build_env=(
 			RUSTC_WRAPPER="${ASTERINAS_DIR}/tools/kcov-rustc.sh"
 			CARGO_PROFILE_DEV_LTO=false
 			CARGO_PROFILE_RELEASE_LTO=false
+			KCOV="${KCOV}"
+			KASAN="${KASAN}"
 		)
 	fi
 	kcmd_log_args=(--kcmd-args="loglevel=error" --kcmd-args="earlycon")
@@ -413,7 +442,7 @@ if [[ "${USE_PREBUILT_NIXOS_IMAGE}" -eq 1 ]]; then
 	fi
 	(
 		cd "${ASTERINAS_DIR}/kernel"
-		env "${kcov_env[@]}" \
+		env "${build_env[@]}" \
 			OSDK_TARGET_ARCH=x86_64 \
 			CARGO_TARGET_DIR="${ASTERINAS_DIR}/target" \
 			"${OSDK_ROOT}/bin/cargo-osdk" build \
@@ -421,7 +450,7 @@ if [[ "${USE_PREBUILT_NIXOS_IMAGE}" -eq 1 ]]; then
 			--kcmd-args="console=ttyS0" \
 			--boot-method="qemu-direct" \
 			--grub-boot-protocol="linux" \
-			"${kcov_features[@]}"
+			"${build_features[@]}"
 	)
 	rm -f "${ASTERINAS_DIR}/ostd/libs/linux-bzimage/setup/Cargo.lock"
 	bzimage="${ASTERINAS_DIR}/target/osdk/${KERNEL_PKG_NAME}/${KERNEL_BIN_NAME}"
@@ -492,6 +521,7 @@ else
 	CARGO_TARGET_DIR="${ASTERINAS_DIR}/target" make -C "${ASTERINAS_DIR}" kernel \
 		CARGO_OSDK="${OSDK_ROOT}/bin/cargo-osdk" \
 		KCOV="${KCOV}" \
+		KASAN="${KASAN}" \
 		RELEASE=0 RELEASE_LTO=0 \
 		TARGET_ARCH=x86_64 \
 		BOOT_PROTOCOL=linux-efi-handover64 \
@@ -513,7 +543,7 @@ else
 	cp --reflink=auto "${asterinas_image}" "${IMAGE}" 2>/dev/null || cp "${asterinas_image}" "${IMAGE}"
 fi
 
-if [[ "${COVER}" == true ]]; then
+if [[ "${COVER}" == true || "${KASAN}" == "1" ]]; then
 	stage_kernel
 fi
 
@@ -523,6 +553,6 @@ Asterinas syzkaller image is ready.
 Image:   ${IMAGE}
 SSH key: ${SSH_KEY}
 EOF
-if [[ "${COVER}" == true ]]; then
+if [[ "${COVER}" == true || "${KASAN}" == "1" ]]; then
 	echo "Kernel:  ${STAGED_KERNEL_OBJ}/vmlinux"
 fi
