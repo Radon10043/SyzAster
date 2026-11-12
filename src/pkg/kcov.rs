@@ -300,6 +300,10 @@ pub fn run_kcov_rustc(args: &[String]) -> Result<(), i32> {
     cmd.args(rest);
 
     if target == Some("x86_64-unknown-none") {
+        if kasan_enabled {
+            cmd.arg("-Cunsafe-allow-abi-mismatch=sanitizer");
+        }
+
         if kcov_enabled && matches!(crate_name, Some("aster_core" | "aster_kernel")) {
             cmd.args([
                 "-C",
@@ -316,7 +320,6 @@ pub fn run_kcov_rustc(args: &[String]) -> Result<(), i32> {
                 .unwrap_or_else(|_| "0xdffffc0000000000".to_string());
             cmd.args([
                 "-Zsanitizer=kernel-address",
-                "-Cunsafe-allow-abi-mismatch=sanitizer",
                 "-C",
                 "llvm-args=-asan-instrumentation-with-call-threshold=0",
                 "-C",
