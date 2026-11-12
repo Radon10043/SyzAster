@@ -1,0 +1,730 @@
+From c4d8ce87530f37976b7295d8e43e872b33e6ef43 Mon Sep 17 00:00:00 2001
+From: Jiaming Zhang <772577952@qq.com>
+Date: Thu, 12 Nov 2026 15:53:41 +0800
+Subject: [PATCH] kasan: implement kernel address sanitizer support
+
+Add KASAN=1 error detection support for Asterinas v0.19.0.
+
+Implement boot-time 4-level zero-page shadow hierarchy in bsp_boot.S,
+dynamic shadow memory mapping in ostd::mm::kspace, comprehensive KASAN
+runtime ABI in ostd::kasan (loads/stores, memory intrinsics, reports,
+globals and noreturn handling) marked with #[sanitize(address = "off")],
+slab/heap allocator hooks in ostd::mm::heap to poison redzones and
+freed memory, and intrusive freelist traversal exemptions in slot_list.
+
+Update Makefile and tools/kcov-rustc.sh to support an independent 4-state
+matrix across KCOV and KASAN, maintaining zero-sancov in ostd and
+applying -Cunsafe-allow-abi-mismatch=sanitizer across target crates.
+---
+ Makefile                          |  23 ++-
+ kernel/Cargo.toml                 |   1 +
+ kernel/core/Cargo.toml            |   1 +
+ ostd/Cargo.toml                   |   1 +
+ ostd/src/arch/x86/boot/bsp_boot.S |  55 ++++++
+ ostd/src/kasan.rs                 | 300 ++++++++++++++++++++++++++++++
+ ostd/src/lib.rs                   |   3 +
+ ostd/src/mm/heap/mod.rs           |  10 +-
+ ostd/src/mm/heap/slot_list.rs     |   2 +
+ ostd/src/mm/kspace/mod.rs         |  59 ++++++
+ tools/kcov-rustc.sh               |  79 +++++++-
+ 11 files changed, 522 insertions(+), 12 deletions(-)
+ create mode 100644 ostd/src/kasan.rs
+
+diff --git a/Makefile b/Makefile
+index d12ea8480..a0fa08319 100644
+--- a/Makefile
++++ b/Makefile
+@@ -22,6 +22,8 @@ NO_DEFAULT_FEATURES ?= 0
+ COVERAGE ?= 0
+ # Linux KCOV feedback for syzkaller, independent of offline source coverage.
+ KCOV ?= 0
++# KernelAddressSanitizer (KASAN) error detection, independent of KCOV.
++KASAN ?= 0
+ INITRAMFS ?= on
+ CMDLINE ?=
+ 
+@@ -232,12 +234,27 @@ endif
+ ifneq ($(RELEASE_LTO), 0)
+ $(error KCOV does not support LTO)
+ endif
++CARGO_OSDK_COMMON_ARGS += --features=kcov
++export KCOV := 1
++endif
++
++ifeq ($(KASAN), 1)
++ifneq ($(TARGET_ARCH), x86_64)
++$(error KASAN currently supports only x86_64)
++endif
++ifneq ($(RELEASE_LTO), 0)
++$(error KASAN does not support LTO)
++endif
++CARGO_OSDK_COMMON_ARGS += --features=kasan
++export KASAN := 1
++endif
++
++ifneq ($(filter 1,$(KCOV) $(KASAN)),)
+ ifneq ($(strip $(RUSTC_WRAPPER)$(RUSTC_WORKSPACE_WRAPPER)),)
+-$(error KCOV requires exclusive use of the Rust compiler wrapper)
++$(error KCOV/KASAN requires exclusive use of the Rust compiler wrapper)
+ endif
+-CARGO_OSDK_COMMON_ARGS += --features=kcov
+ export RUSTC_WRAPPER := $(CURDIR)/tools/kcov-rustc.sh
+-# Keep the uninstrumented OSTD runtime out of cross-crate LTO.
++# Keep uninstrumented code out of cross-crate LTO.
+ export CARGO_PROFILE_DEV_LTO := false
+ export CARGO_PROFILE_RELEASE_LTO := false
+ endif
+diff --git a/kernel/Cargo.toml b/kernel/Cargo.toml
+index 01d5446bd..0ad4f512b 100644
+--- a/kernel/Cargo.toml
++++ b/kernel/Cargo.toml
+@@ -21,6 +21,7 @@ aster-i8042.workspace = true
+ default = ["cvm_guest"]
+ coverage = ["aster-core/coverage"]
+ kcov = ["aster-core/kcov"]
++kasan = ["aster-core/kasan"]
+ cvm_guest = ["aster-core/cvm_guest"]
+ pvh_boot = ["aster-core/pvh_boot"]
+ riscv_sv39_mode = ["aster-core/riscv_sv39_mode"]
+diff --git a/kernel/core/Cargo.toml b/kernel/core/Cargo.toml
+index aa580be42..08c3c8b90 100644
+--- a/kernel/core/Cargo.toml
++++ b/kernel/core/Cargo.toml
+@@ -79,6 +79,7 @@ loongArch64.workspace = true
+ default = ["cvm_guest"]
+ coverage = ["ostd/coverage"]
+ kcov = ["ostd/kcov"]
++kasan = ["ostd/kasan"]
+ cvm_guest = ["dep:tdx-guest", "ostd/cvm_guest", "aster-virtio/cvm_guest"]
+ pvh_boot = ["ostd/pvh_boot"]
+ # By default we use the Sv48 address translation mode.
+diff --git a/ostd/Cargo.toml b/ostd/Cargo.toml
+index 54de6165f..2e1388e62 100644
+--- a/ostd/Cargo.toml
++++ b/ostd/Cargo.toml
+@@ -75,6 +75,7 @@ default = ["cvm_guest"]
+ cvm_guest = ["dep:tdx-guest"]
+ coverage = ["minicov"]
+ kcov = []
++kasan = []
+ pvh_boot = []
+ riscv_sv39_mode = []
+ 
+diff --git a/ostd/src/arch/x86/boot/bsp_boot.S b/ostd/src/arch/x86/boot/bsp_boot.S
+index fe805476c..9ebee594a 100644
+--- a/ostd/src/arch/x86/boot/bsp_boot.S
++++ b/ostd/src/arch/x86/boot/bsp_boot.S
+@@ -262,6 +262,48 @@ write_l2pt_entry_\bits:
+     add edi, 8
+     loop write_l2pt_entry_\bits
+ 
++    // Setup KASAN early shadow L1PT: map all 512 entries to boot_kasan_zero_page
++    lea edi, [boot_kasan_l1pt]
++    lea eax, [boot_kasan_zero_page + (PTE_PRESENT | PTE_WRITE | PTE_GLOBAL)]
++    mov ecx, 512
++write_kasan_l1pt_\bits:
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
++    add edi, 8
++    loop write_kasan_l1pt_\bits
++
++    // Setup KASAN early shadow L2PT: map all 512 entries to boot_kasan_l1pt
++    lea edi, [boot_kasan_l2pt]
++    lea eax, [boot_kasan_l1pt + (PTE_PRESENT | PTE_WRITE | PTE_GLOBAL)]
++    mov ecx, 512
++write_kasan_l2pt_\bits:
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
++    add edi, 8
++    loop write_kasan_l2pt_\bits
++
++    // Setup KASAN early shadow L3PT:
++    // Entry 0 covers shadow of linear map [0xffff8000_00000000, 0xffff8000_ffffffff]
++    lea edi, [boot_kasan_l3pt]
++    lea eax, [boot_kasan_l2pt + (PTE_PRESENT | PTE_WRITE | PTE_GLOBAL)]
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
++
++    // Entry 511 covers shadow of kernel image [0xffffffff_80000000, 0xffffffff_ffffffff]
++    lea edi, [boot_kasan_l3pt + 511 * 8]
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
++
++    // L4PT: Map KASAN shadow PML4 entries 472..503 (0xffff_ec00_0000_0000 .. 0xffff_fc00_0000_0000)
++    lea edi, [boot_l4pt + 472 * 8]
++    lea eax, [boot_kasan_l3pt + (PTE_PRESENT | PTE_WRITE)]
++    mov ecx, 32
++write_kasan_l4pt_\bits:
++    mov dword ptr [edi], eax
++    mov dword ptr [edi + 4], 0
++    add edi, 8
++    loop write_kasan_l4pt_\bits
++
+     ret
+ .endm
+ 
+@@ -310,6 +352,19 @@ boot_l2pt_2g_3g:
+     .skip 4096
+ boot_l2pt_3g_4g:
+     .skip 4096
++// Early KASAN shadow page tables and zero page
++.global boot_kasan_l3pt
++boot_kasan_l3pt:
++    .skip 4096
++.global boot_kasan_l2pt
++boot_kasan_l2pt:
++    .skip 4096
++.global boot_kasan_l1pt
++boot_kasan_l1pt:
++    .skip 4096
++.global boot_kasan_zero_page
++boot_kasan_zero_page:
++    .skip 4096
+ boot_page_table_end:
+ 
+ .code64
+diff --git a/ostd/src/kasan.rs b/ostd/src/kasan.rs
+new file mode 100644
+index 000000000..36caa6898
+--- /dev/null
++++ b/ostd/src/kasan.rs
+@@ -0,0 +1,300 @@
++// SPDX-License-Identifier: MPL-2.0
++
++//! KernelAddressSanitizer (KASAN) runtime for Asterinas.
++//!
++//! Generic KASAN implementation targeting x86_64.
++//! Shadow mapping formula:
++//!     shadow_addr = (addr >> 3) + SHADOW_OFFSET
++//!
++//! Kernel address space [0xffff_8000_0000_0000, 0xffff_ffff_ffff_ffff] (128 TiB)
++//! is shadowed into [0xffff_ec00_0000_0000, 0xffff_fc00_0000_0000) (16 TiB).
++
++#![allow(missing_docs)]
++
++use core::sync::atomic::{AtomicBool, Ordering};
++
++/// 1 shadow byte covers 8 application bytes (scale = 3).
++pub const SHADOW_SCALE: usize = 3;
++
++/// KASAN shadow offset for x86_64 48-bit address space.
++pub const SHADOW_OFFSET: usize = 0xdffffc0000000000;
++
++/// Base of the 16 TiB KASAN shadow space for the kernel higher-half.
++pub const KASAN_SHADOW_START: usize = 0xffff_ec00_0000_0000;
++
++/// Cap of the 16 TiB KASAN shadow space.
++pub const KASAN_SHADOW_END: usize = 0xffff_fc00_0000_0000;
++
++// Poison byte values:
++/// Granule is completely accessible.
++pub const KASAN_UNPOISONED: i8 = 0x00;
++/// Free page.
++pub const KASAN_PAGE_FREE: i8 = -2; // 0xfe
++/// Heap slot freed (quarantine / use-after-free).
++pub const KASAN_SLAB_FREE: i8 = -3; // 0xfd
++/// Heap slot redzone (slab-out-of-bounds).
++pub const KASAN_SLAB_REDZONE: i8 = -6; // 0xfa
++/// Global variable redzone.
++pub const KASAN_GLOBAL_REDZONE: i8 = -7; // 0xf9
++/// Stack variable left redzone.
++pub const KASAN_STACK_LEFT: i8 = -15; // 0xf1
++/// Stack variable middle redzone.
++pub const KASAN_STACK_MID: i8 = -14; // 0xf2
++/// Stack variable right redzone.
++pub const KASAN_STACK_RIGHT: i8 = -13; // 0xf3
++
++/// Reentrancy guard to prevent recursive error reporting.
++static IN_KASAN_REPORT: AtomicBool = AtomicBool::new(false);
++
++/// Converts a kernel virtual address to its corresponding shadow memory pointer.
++#[inline(never)]
++#[sanitize(address = "off")]
++pub fn addr_to_shadow(addr: usize) -> *mut i8 {
++    let shadow_addr = (addr >> SHADOW_SCALE).wrapping_add(SHADOW_OFFSET);
++    shadow_addr as *mut i8
++}
++
++/// Checks whether an address range is accessible according to shadow memory.
++#[inline(never)]
++#[sanitize(address = "off")]
++pub fn check_memory_region(addr: usize, size: usize, is_write: bool) {
++    if size == 0 {
++        return;
++    }
++
++    // Filter out invalid/user addresses in kernel context
++    if addr < 0xffff_8000_0000_0000 {
++        report_error(addr, size, is_write, "user-or-null-ptr-deref", 0);
++        return;
++    }
++
++    // Prevent recursion during report
++    if IN_KASAN_REPORT.load(Ordering::Relaxed) {
++        return;
++    }
++
++    let first_granule = addr >> SHADOW_SCALE;
++    let last_granule = (addr + size - 1) >> SHADOW_SCALE;
++
++    for g in first_granule..=last_granule {
++        let shadow_ptr = (g.wrapping_add(SHADOW_OFFSET)) as *const i8;
++        let shadow_val = unsafe { *shadow_ptr };
++
++        if shadow_val != 0 {
++            if shadow_val < 0 {
++                report_error(addr, size, is_write, error_type_name(shadow_val), shadow_val);
++                return;
++            }
++            if g < last_granule {
++                report_error(addr, size, is_write, error_type_name(shadow_val), shadow_val);
++                return;
++            }
++            let last_byte = ((addr + size - 1) & 7) as i8;
++            if last_byte >= shadow_val {
++                report_error(addr, size, is_write, error_type_name(shadow_val), shadow_val);
++                return;
++            }
++        }
++    }
++}
++
++/// Sets shadow bytes for a memory range to a poison value.
++#[sanitize(address = "off")]
++pub fn poison_range(addr: usize, size: usize, val: i8) {
++    if size == 0 || addr < 0xffff_8000_0000_0000 {
++        return;
++    }
++    let first_granule = addr >> SHADOW_SCALE;
++    let last_granule = (addr + size - 1) >> SHADOW_SCALE;
++
++    for g in first_granule..=last_granule {
++        let shadow_ptr = (g.wrapping_add(SHADOW_OFFSET)) as *mut i8;
++        unsafe { *shadow_ptr = val };
++    }
++}
++
++/// Marks a memory range as unpoisoned (valid for access).
++#[sanitize(address = "off")]
++pub fn unpoison_range(addr: usize, size: usize) {
++    if size == 0 || addr < 0xffff_8000_0000_0000 {
++        return;
++    }
++    let mut p = addr;
++    let mut s = size;
++    while s >= 8 {
++        let g = p >> SHADOW_SCALE;
++        let shadow_ptr = (g.wrapping_add(SHADOW_OFFSET)) as *mut i8;
++        unsafe { *shadow_ptr = KASAN_UNPOISONED };
++        p += 8;
++        s -= 8;
++    }
++    if s > 0 {
++        let g = p >> SHADOW_SCALE;
++        let shadow_ptr = (g.wrapping_add(SHADOW_OFFSET)) as *mut i8;
++        unsafe { *shadow_ptr = s as i8 };
++    }
++}
++
++/// Allocator hook: unpoisons user object range and poisons redzone.
++#[sanitize(address = "off")]
++pub fn alloc_hook(ptr: usize, req_size: usize, slot_size: usize) {
++    if ptr < 0xffff_8000_0000_0000 {
++        return;
++    }
++    unpoison_range(ptr, req_size);
++    let redzone_start = ptr + ((req_size + 7) & !7);
++    if redzone_start < ptr + slot_size {
++        poison_range(
++            redzone_start,
++            (ptr + slot_size) - redzone_start,
++            KASAN_SLAB_REDZONE,
++        );
++    }
++}
++
++/// Allocator hook: poisons freed slot memory as use-after-free.
++#[sanitize(address = "off")]
++pub fn free_hook(ptr: usize, slot_size: usize) {
++    if ptr < 0xffff_8000_0000_0000 {
++        return;
++    }
++    poison_range(ptr, slot_size, KASAN_SLAB_FREE);
++}
++
++/// Formats and reports a KASAN bug, printing diagnostics and halting.
++#[cold]
++#[inline(never)]
++#[sanitize(address = "off")]
++pub fn report_error(addr: usize, size: usize, is_write: bool, error_type: &str, shadow_val: i8) {
++    if IN_KASAN_REPORT.swap(true, Ordering::SeqCst) {
++        crate::power::poweroff(crate::power::ExitCode::Failure);
++    }
++
++    let access_str = if is_write { "Write" } else { "Read" };
++
++    crate::early_println!("==================================================================");
++    crate::early_println!("BUG: KASAN: {} on address {:#x}", error_type, addr);
++    crate::early_println!("{} of size {} at addr {:#x}", access_str, size, addr);
++    crate::early_println!("Shadow byte value: {:#04x}", (shadow_val as u8));
++    crate::early_println!("==================================================================");
++
++    crate::panic::print_stack_trace();
++    crate::panic::abort();
++}
++
++#[sanitize(address = "off")]
++fn error_type_name(shadow_val: i8) -> &'static str {
++    match shadow_val {
++        KASAN_SLAB_FREE => "heap-use-after-free",
++        KASAN_PAGE_FREE => "page-use-after-free",
++        KASAN_SLAB_REDZONE => "slab-out-of-bounds",
++        KASAN_STACK_LEFT | KASAN_STACK_MID | KASAN_STACK_RIGHT => "stack-out-of-bounds",
++        KASAN_GLOBAL_REDZONE => "global-out-of-bounds",
++        1..=7 => "slab-out-of-bounds",
++        _ => "out-of-bounds",
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Compiler ABI Functions
++// ---------------------------------------------------------------------------
++
++macro_rules! define_asan_load_store {
++    ($n:expr, $load_fn:ident, $store_fn:ident, $report_load_fn:ident, $report_store_fn:ident) => {
++        #[unsafe(no_mangle)]
++        #[sanitize(address = "off")]
++        pub extern "C" fn $load_fn(addr: usize) {
++            check_memory_region(addr, $n, false);
++        }
++
++        #[unsafe(no_mangle)]
++        #[sanitize(address = "off")]
++        pub extern "C" fn $store_fn(addr: usize) {
++            check_memory_region(addr, $n, true);
++        }
++
++        #[unsafe(no_mangle)]
++        #[sanitize(address = "off")]
++        pub extern "C" fn $report_load_fn(addr: usize) {
++            let sh = unsafe { *addr_to_shadow(addr) };
++            report_error(addr, $n, false, error_type_name(sh), sh);
++        }
++
++        #[unsafe(no_mangle)]
++        #[sanitize(address = "off")]
++        pub extern "C" fn $report_store_fn(addr: usize) {
++            let sh = unsafe { *addr_to_shadow(addr) };
++            report_error(addr, $n, true, error_type_name(sh), sh);
++        }
++    };
++}
++
++define_asan_load_store!(1, __asan_load1, __asan_store1, __asan_report_load1, __asan_report_store1);
++define_asan_load_store!(2, __asan_load2, __asan_store2, __asan_report_load2, __asan_report_store2);
++define_asan_load_store!(4, __asan_load4, __asan_store4, __asan_report_load4, __asan_report_store4);
++define_asan_load_store!(8, __asan_load8, __asan_store8, __asan_report_load8, __asan_report_store8);
++define_asan_load_store!(16, __asan_load16, __asan_store16, __asan_report_load16, __asan_report_store16);
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_loadN(addr: usize, size: usize) {
++    check_memory_region(addr, size, false);
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_storeN(addr: usize, size: usize) {
++    check_memory_region(addr, size, true);
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_report_load_n(addr: usize, size: usize) {
++    let sh = unsafe { *addr_to_shadow(addr) };
++    report_error(addr, size, false, error_type_name(sh), sh);
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_report_store_n(addr: usize, size: usize) {
++    let sh = unsafe { *addr_to_shadow(addr) };
++    report_error(addr, size, true, error_type_name(sh), sh);
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
++    check_memory_region(src as usize, n, false);
++    check_memory_region(dst as usize, n, true);
++    unsafe { core::ptr::copy_nonoverlapping(src, dst, n) };
++    dst
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
++    check_memory_region(src as usize, n, false);
++    check_memory_region(dst as usize, n, true);
++    unsafe { core::ptr::copy(src, dst, n) };
++    dst
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_memset(dst: *mut u8, val: i32, n: usize) -> *mut u8 {
++    check_memory_region(dst as usize, n, true);
++    unsafe { core::ptr::write_bytes(dst, val as u8, n) };
++    dst
++}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_handle_no_return() {}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_register_globals(_globals: usize, _n: usize) {}
++
++#[unsafe(no_mangle)]
++#[sanitize(address = "off")]
++pub extern "C" fn __asan_unregister_globals(_globals: usize, _n: usize) {}
+diff --git a/ostd/src/lib.rs b/ostd/src/lib.rs
+index 68e82827e..3f3b0d056 100644
+--- a/ostd/src/lib.rs
++++ b/ostd/src/lib.rs
+@@ -10,6 +10,7 @@
+ #![feature(negative_impls)]
+ #![feature(ptr_metadata)]
+ #![feature(sync_unsafe_cell)]
++#![feature(sanitize)]
+ #![cfg_attr(target_arch = "riscv64", feature(riscv_ext_intrinsics))]
+ #![cfg_attr(target_arch = "x86_64", feature(iter_advance_by, macro_metavar_expr))]
+ #![cfg_attr(target_arch = "aarch64", feature(iter_next_chunk))]
+@@ -43,6 +44,8 @@ pub mod io;
+ pub mod irq;
+ #[cfg(feature = "kcov")]
+ pub mod kcov;
++#[cfg(feature = "kasan")]
++pub mod kasan;
+ pub mod log;
+ pub mod mm;
+ pub mod panic;
+diff --git a/ostd/src/mm/heap/mod.rs b/ostd/src/mm/heap/mod.rs
+index 58f15b90b..f7d3a1f59 100644
+--- a/ostd/src/mm/heap/mod.rs
++++ b/ostd/src/mm/heap/mod.rs
+@@ -121,7 +121,12 @@ unsafe impl GlobalAlloc for AllocDispatch {
+             );
+         }
+ 
+-        slot.as_ptr()
++        let ptr = slot.as_ptr();
++
++        #[cfg(feature = "kasan")]
++        crate::kasan::alloc_hook(ptr as usize, layout.size(), slot.size());
++
++        ptr
+     }
+ 
+     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+@@ -147,5 +152,8 @@ unsafe impl GlobalAlloc for AllocDispatch {
+                 required_slot,
+             );
+         }
++
++        #[cfg(feature = "kasan")]
++        crate::kasan::free_hook(ptr as usize, required_slot.size());
+     }
+ }
+diff --git a/ostd/src/mm/heap/slot_list.rs b/ostd/src/mm/heap/slot_list.rs
+index 6eb56125c..6cf1fe694 100644
+--- a/ostd/src/mm/heap/slot_list.rs
++++ b/ostd/src/mm/heap/slot_list.rs
+@@ -43,6 +43,7 @@ impl<const SLOT_SIZE: usize> SlabSlotList<SLOT_SIZE> {
+     ///  - the slot does not come from a slab
+     ///    (i.e., `!matches(slot.info(), SlotInfo::SlabSlot(_))`);
+     ///  - the size of the slot does not match `SLOT_SIZE`.
++    #[sanitize(address = "off")]
+     pub fn push(&mut self, slot: HeapSlot) {
+         let slot_ptr = slot.as_ptr();
+         let super::SlotInfo::SlabSlot(slot_size) = slot.info() else {
+@@ -70,6 +71,7 @@ impl<const SLOT_SIZE: usize> SlabSlotList<SLOT_SIZE> {
+     /// Pops a slot from the front of the list.
+     ///
+     /// It returns `None` if the list is empty.
++    #[sanitize(address = "off")]
+     pub fn pop(&mut self) -> Option<HeapSlot> {
+         let original_head = self.head?;
+ 
+diff --git a/ostd/src/mm/kspace/mod.rs b/ostd/src/mm/kspace/mod.rs
+index 9955ed994..e6ee822ae 100644
+--- a/ostd/src/mm/kspace/mod.rs
++++ b/ostd/src/mm/kspace/mod.rs
+@@ -301,9 +301,68 @@ pub(crate) fn init_kernel_page_table(meta_pages: Segment<MetaPageMeta>) {
+         }
+     }
+ 
++    #[cfg(feature = "kasan")]
++    {
++        init_kasan_shadow(&kpt, &preempt_guard);
++    }
++
+     KERNEL_PAGE_TABLE.call_once(|| kpt);
+ }
+ 
++#[cfg(feature = "kasan")]
++fn init_kasan_shadow(
++    kpt: &PageTable<KernelPtConfig>,
++    preempt_guard: &crate::task::DisabledPreemptGuard,
++) {
++    use align_ext::AlignExt;
++    use crate::mm::FrameAllocOptions;
++
++    crate::info!("Initializing KASAN shadow memory mappings");
++
++    let max_paddr = crate::mm::frame::max_paddr();
++    let shadow_ram_start = crate::kasan::KASAN_SHADOW_START;
++    let shadow_ram_len = (max_paddr >> crate::kasan::SHADOW_SCALE).align_up(PAGE_SIZE);
++    let shadow_ram_end = shadow_ram_start + shadow_ram_len;
++
++    let prop = PageProperty {
++        flags: PageFlags::RW,
++        cache: CachePolicy::Writeback,
++        priv_flags: PrivilegedPageFlags::GLOBAL,
++    };
++
++    const CHUNK_SIZE: usize = 2 * 1024 * 1024;
++    let mut cur_va = shadow_ram_start;
++    while cur_va < shadow_ram_end {
++        let remaining = shadow_ram_end - cur_va;
++        let chunk_len = core::cmp::min(CHUNK_SIZE, remaining);
++
++        let nframes = chunk_len / PAGE_SIZE;
++        let seg = FrameAllocOptions::new()
++            .zeroed(true)
++            .alloc_segment(nframes);
++
++        if let Ok(segment) = seg {
++            let pa_range = segment.into_raw();
++            let from = cur_va..cur_va + chunk_len;
++            let min_level = max_page_level::<KernelPtConfig>(chunk_len);
++            let mut cursor = kpt
++                .cursor_mut_with_min_level(preempt_guard, &from, min_level)
++                .unwrap();
++            for (pa, level) in largest_pages::<KernelPtConfig>(from.start, pa_range.start, chunk_len) {
++                // SAFETY: We are mapping the KASAN shadow memory for the kernel.
++                unsafe { cursor.map(MappedItem::Untracked(pa, level, prop)) };
++            }
++        }
++        cur_va += chunk_len;
++    }
++
++    crate::info!(
++        "KASAN shadow mapping complete: [{:#x}, {:#x})",
++        shadow_ram_start,
++        shadow_ram_end
++    );
++}
++
+ /// Activates the kernel page table.
+ ///
+ /// All address translation of symbols in the boot sections must be manually
+diff --git a/tools/kcov-rustc.sh b/tools/kcov-rustc.sh
+index 2d345bb40..4314ec2dc 100755
+--- a/tools/kcov-rustc.sh
++++ b/tools/kcov-rustc.sh
+@@ -1,8 +1,14 @@
+ #!/usr/bin/env bash
+ # SPDX-License-Identifier: MPL-2.0
+ 
+-# Instrument only the safe syscall implementation crate. OSTD, the allocator,
+-# and the compiler's host tools must never acquire sanitizer callbacks.
++# Rust compiler wrapper for Asterinas supporting independent KCOV and KASAN instrumentation.
++#
++# Matrix modes:
++# - KCOV=1, KASAN=0: Sancov instrumentation for aster_core only; ostd uninstrumented.
++# - KCOV=0, KASAN=1: KASAN outline instrumentation for aster_core and ostd.
++# - KCOV=1, KASAN=1: Joint coverage and memory error detection.
++# - KCOV=0, KASAN=0: Uninstrumented baseline.
++
+ set -euo pipefail
+ rustc=$1
+ shift
+@@ -16,10 +22,67 @@ while (($#)); do
+         *) shift ;;
+     esac
+ done
+-if [[ "$crate_name" == aster_core && "$target" == x86_64-unknown-none ]]; then
+-    exec "$rustc" "${args[@]}" \
+-        -C passes=sancov-module \
+-        -C llvm-args=-sanitizer-coverage-level=3 \
+-        -C llvm-args=-sanitizer-coverage-trace-pc
++
++kcov_env="${KCOV:-}"
++kasan_env="${KASAN:-}"
++
++kcov_enabled=0
++kasan_enabled=0
++
++if [[ "$kcov_env" == "1" && "$kasan_env" == "1" ]]; then
++    kcov_enabled=1
++    kasan_enabled=1
++elif [[ "$kcov_env" == "1" ]]; then
++    kcov_enabled=1
++    kasan_enabled=0
++elif [[ "$kcov_env" == "0" && "$kasan_env" == "1" ]]; then
++    kcov_enabled=0
++    kasan_enabled=1
++elif [[ "$kcov_env" == "0" ]]; then
++    kcov_enabled=0
++    kasan_enabled=0
++elif [[ -z "$kcov_env" && "$kasan_env" == "1" ]]; then
++    kcov_enabled=0
++    kasan_enabled=1
++elif [[ -z "$kcov_env" && "$kasan_env" == "0" ]]; then
++    kcov_enabled=1
++    kasan_enabled=0
++elif [[ -z "$kcov_env" && -z "$kasan_env" ]]; then
++    # Default legacy mode: KCOV enabled
++    kcov_enabled=1
++    kasan_enabled=0
++fi
++
++extra_flags=()
++
++if [[ "$target" == "x86_64-unknown-none" ]]; then
++    if [[ "$kasan_enabled" == "1" ]]; then
++        extra_flags+=(-Cunsafe-allow-abi-mismatch=sanitizer)
++    fi
++
++    # KCOV instrumentation: aster_core / aster_kernel only; ostd NEVER gets sancov.
++    if [[ "$kcov_enabled" == "1" ]] && [[ "$crate_name" == "aster_core" || "$crate_name" == "aster_kernel" ]]; then
++        extra_flags+=(
++            -C passes=sancov-module
++            -C llvm-args=-sanitizer-coverage-level=3
++            -C llvm-args=-sanitizer-coverage-trace-pc
++        )
++    fi
++
++    # KASAN instrumentation: aster_core, aster_kernel, and ostd.
++    # Note: KASAN runtime functions inside ostd are exempted via #[sanitize(address = "off")].
++    if [[ "$kasan_enabled" == "1" ]] && [[ "$crate_name" == "aster_core" || "$crate_name" == "aster_kernel" || "$crate_name" == "ostd" ]]; then
++        shadow_offset="${KASAN_SHADOW_OFFSET:-0xdffffc0000000000}"
++        extra_flags+=(
++            -Zsanitizer=kernel-address
++            -C llvm-args=-asan-instrumentation-with-call-threshold=0
++            -C llvm-args=-asan-stack=0
++            -C llvm-args=-asan-globals=0
++            -C llvm-args=-asan-kernel-mem-intrinsic-prefix=1
++            -C llvm-args=-asan-mapping-scale=3
++            -C "llvm-args=-asan-mapping-offset=${shadow_offset}"
++        )
++    fi
+ fi
+-exec "$rustc" "${args[@]}"
++
++exec "$rustc" "${args[@]}" "${extra_flags[@]}"
+-- 
+2.43.0
+
