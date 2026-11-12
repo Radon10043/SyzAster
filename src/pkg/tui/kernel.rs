@@ -27,6 +27,7 @@ pub struct KernelTab {
     dir: PathBuf,
     patch: bool,
     kcov: bool,
+    kasan: bool,
     image_override: Option<PathBuf>,
     cfg_override: Option<PathBuf>,
     list: ListState,
@@ -107,6 +108,7 @@ impl KernelTab {
             dir: path("kernel.dir").unwrap_or_else(|| default_dir(root)),
             patch: s.get("kernel.patch") != Some("false"),
             kcov: s.get("kernel.kcov") != Some("false"),
+            kasan: s.get("kernel.kasan") == Some("true"),
             image_override: path("kernel.image"),
             cfg_override: path("kernel.cfg"),
             list: ListState::default(),
@@ -248,6 +250,10 @@ impl KernelTab {
                 .icon(ic.radar)
                 .on(self.kcov)
                 .help("ON builds with KCOV=1: only aster_core gets sancov trace-pc callbacks, OSTD stays uninstrumented. OFF passes --no-cover for an uninstrumented baseline image."),
+            Item::new("kasan", ItemKind::Toggle, "KASAN instrumentation")
+                .icon(ic.bug)
+                .on(self.kasan)
+                .help("ON builds with KASAN=1: instruments memory accesses with shadow checks in ostd and aster_core to detect out-of-bounds and UAF. OFF builds without KASAN."),
             Item::section("Actions"),
             Item::new("download", ItemKind::Action, "Download & patch kernel")
                 .icon(ic.play)
@@ -362,6 +368,11 @@ impl KernelTab {
                 s.set("kernel.kcov", self.kcov.to_string());
                 Vec::new()
             }
+            "kasan" => {
+                self.kasan = !self.kasan;
+                s.set("kernel.kasan", self.kasan.to_string());
+                Vec::new()
+            }
             "edit" => self.edit_cfg(),
             "refresh" => {
                 self.refresh();
@@ -459,6 +470,9 @@ impl KernelTab {
                 if !self.kcov {
                     args.push("--no-cover".to_string());
                 }
+                if self.kasan {
+                    args.push("--kasan".to_string());
+                }
                 let script = root
                     .join("scripts")
                     .join("asterinas")
@@ -470,13 +484,16 @@ impl KernelTab {
                 );
                 job.after = After::Kernel;
                 job.inline = true;
+                let mode_str = match (self.kcov, self.kasan) {
+                    (true, true) => "KCOV=1 KASAN=1",
+                    (true, false) => "KCOV=1",
+                    (false, true) => "KASAN=1",
+                    (false, false) => "KCOV=0 KASAN=0",
+                };
                 let lines = vec![
                     vec![
                         span("Build the ", theme::BASE),
-                        span(
-                            if self.kcov { "KCOV=1" } else { "KCOV=0" },
-                            st(theme::YELLOW).bold(),
-                        ),
+                        span(mode_str, st(theme::YELLOW).bold()),
                         span(" kernel and NixOS image into:", theme::BASE),
                     ],
                     vec![span(
@@ -743,9 +760,10 @@ mod tests {
 
     #[test]
     fn reads_flat_toml_values() {
-        let t = "[kernel]\nname = \"asterinas\"\ncommit = \"abc123\" # pinned\nkcov = 1\n";
+        let t = "[kernel]\nname = \"asterinas\"\ncommit = \"abc123\" # pinned\nkcov = 1\nkasan = 1\n";
         assert_eq!(toml_value(t, "commit"), Some("abc123".to_string()));
         assert_eq!(toml_value(t, "kcov"), Some("1".to_string()));
+        assert_eq!(toml_value(t, "kasan"), Some("1".to_string()));
         assert_eq!(toml_value(t, "missing"), None);
     }
 }
