@@ -123,3 +123,88 @@ fn test_check_kcov_inst_live_rustc() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("PASS: safe kernel gets trace-pc callbacks; OSTD remains uninstrumented"));
 }
+
+#[test]
+fn test_kcov_rustc_wrapper_matrix() {
+    let tmp = TempDir::new("kcov-matrix-test-").unwrap();
+    let probe_rs = tmp.path().join("probe.rs");
+    fs::write(
+        &probe_rs,
+        "#![no_std]\n\
+         #[no_mangle]\n\
+         pub unsafe extern \"C\" fn test_fn(p: *mut u64) -> u64 {\n\
+             if *p > 10 { *p + 1 } else { *p * 2 }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let wrapper_bin = PathBuf::from(env!("CARGO_BIN_EXE_kcov-rustc"));
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+
+    let inspect_symbols = |crate_name: &str, kcov: &str, kasan: &str| -> (bool, bool) {
+        let out_obj = tmp.path().join(format!("{}_{}_{}.o", crate_name, kcov, kasan));
+        let mut cmd = Command::new(&wrapper_bin);
+        cmd.args([
+            &rustc,
+            "--crate-name",
+            crate_name,
+            "--crate-type",
+            "lib",
+            "--target",
+            "x86_64-unknown-none",
+            "--emit=obj",
+            "-C",
+            "opt-level=1",
+            probe_rs.to_str().unwrap(),
+            "-o",
+            out_obj.to_str().unwrap(),
+        ]);
+        cmd.env("KCOV", kcov);
+        cmd.env("KASAN", kasan);
+        let res = cmd.output().expect("compile probe");
+        assert!(
+            res.status.success(),
+            "compilation failed for crate {} (KCOV={} KASAN={}):\nstderr: {}",
+            crate_name,
+            kcov,
+            kasan,
+            String::from_utf8_lossy(&res.stderr)
+        );
+        let elf_info = syzaster::pkg::elf::inspect_elf(&out_obj).unwrap();
+        let has_kcov = elf_info.references_undefined_symbol("__sanitizer_cov_trace_pc");
+        let has_kasan = elf_info.references_undefined_symbol("__asan_load8");
+        (has_kcov, has_kasan)
+    };
+
+    // Mode 1: KCOV=1, KASAN=0
+    let (core_kcov, core_kasan) = inspect_symbols("aster_core", "1", "0");
+    assert!(core_kcov, "aster_core under KCOV=1 must have sancov");
+    assert!(!core_kasan, "aster_core under KASAN=0 must not have KASAN");
+    let (ostd_kcov, ostd_kasan) = inspect_symbols("ostd", "1", "0");
+    assert!(!ostd_kcov, "ostd must never have sancov");
+    assert!(!ostd_kasan, "ostd under KASAN=0 must not have KASAN");
+
+    // Mode 2: KCOV=0, KASAN=1
+    let (core_kcov, core_kasan) = inspect_symbols("aster_core", "0", "1");
+    assert!(!core_kcov, "aster_core under KCOV=0 must not have sancov");
+    assert!(core_kasan, "aster_core under KASAN=1 must have KASAN");
+    let (ostd_kcov, ostd_kasan) = inspect_symbols("ostd", "0", "1");
+    assert!(!ostd_kcov, "ostd must never have sancov");
+    assert!(ostd_kasan, "ostd under KASAN=1 must have KASAN");
+
+    // Mode 3: KCOV=1, KASAN=1
+    let (core_kcov, core_kasan) = inspect_symbols("aster_core", "1", "1");
+    assert!(core_kcov, "aster_core under KCOV=1,KASAN=1 must have sancov");
+    assert!(core_kasan, "aster_core under KCOV=1,KASAN=1 must have KASAN");
+    let (ostd_kcov, ostd_kasan) = inspect_symbols("ostd", "1", "1");
+    assert!(!ostd_kcov, "ostd under KCOV=1,KASAN=1 must never have sancov");
+    assert!(ostd_kasan, "ostd under KCOV=1,KASAN=1 must have KASAN");
+
+    // Mode 4: KCOV=0, KASAN=0
+    let (core_kcov, core_kasan) = inspect_symbols("aster_core", "0", "0");
+    assert!(!core_kcov, "baseline aster_core must not have sancov");
+    assert!(!core_kasan, "baseline aster_core must not have KASAN");
+    let (ostd_kcov, ostd_kasan) = inspect_symbols("ostd", "0", "0");
+    assert!(!ostd_kcov, "baseline ostd must not have sancov");
+    assert!(!ostd_kasan, "baseline ostd must not have KASAN");
+}

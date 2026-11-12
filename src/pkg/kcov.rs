@@ -248,7 +248,8 @@ pub fn run_check_asterinas_kcov(prog: &str, args: &[String]) -> Result<(), i32> 
     Ok(())
 }
 
-/// Rust compiler wrapper (`kcov-rustc`) that instruments only `aster_core` for `x86_64-unknown-none`.
+/// Rust compiler wrapper (`kcov-rustc`) that instruments `aster_core` (for KCOV)
+/// and `aster_core`/`ostd` (for KASAN) on `x86_64-unknown-none`.
 pub fn run_kcov_rustc(args: &[String]) -> Result<(), i32> {
     if args.is_empty() {
         eprintln!("Usage: kcov-rustc <RUSTC> [ARGS...]");
@@ -281,19 +282,55 @@ pub fn run_kcov_rustc(args: &[String]) -> Result<(), i32> {
         i += 1;
     }
 
+    let kcov_env = env::var("KCOV").ok();
+    let kasan_env = env::var("KASAN").ok();
+
+    let (kcov_enabled, kasan_enabled) = match (kcov_env.as_deref(), kasan_env.as_deref()) {
+        (Some("1"), Some("1")) => (true, true),
+        (Some("1"), _) => (true, false),
+        (Some("0"), Some("1")) => (false, true),
+        (Some("0"), _) => (false, false),
+        (None, Some("1")) => (false, true),
+        (None, Some("0")) => (true, false),
+        (None, None) => (true, false),
+        _ => (false, false),
+    };
+
     let mut cmd = Command::new(rustc);
     cmd.args(rest);
-    if matches!(crate_name, Some("aster_core" | "aster_kernel"))
-        && target == Some("x86_64-unknown-none")
-    {
-        cmd.args([
-            "-C",
-            "passes=sancov-module",
-            "-C",
-            "llvm-args=-sanitizer-coverage-level=3",
-            "-C",
-            "llvm-args=-sanitizer-coverage-trace-pc",
-        ]);
+
+    if target == Some("x86_64-unknown-none") {
+        if kcov_enabled && matches!(crate_name, Some("aster_core" | "aster_kernel")) {
+            cmd.args([
+                "-C",
+                "passes=sancov-module",
+                "-C",
+                "llvm-args=-sanitizer-coverage-level=3",
+                "-C",
+                "llvm-args=-sanitizer-coverage-trace-pc",
+            ]);
+        }
+
+        if kasan_enabled && matches!(crate_name, Some("aster_core" | "aster_kernel" | "ostd")) {
+            let offset = env::var("KASAN_SHADOW_OFFSET")
+                .unwrap_or_else(|_| "0xdffffc0000000000".to_string());
+            cmd.args([
+                "-Zsanitizer=kernel-address",
+                "-Cunsafe-allow-abi-mismatch=sanitizer",
+                "-C",
+                "llvm-args=-asan-instrumentation-with-call-threshold=0",
+                "-C",
+                "llvm-args=-asan-stack=0",
+                "-C",
+                "llvm-args=-asan-globals=0",
+                "-C",
+                "llvm-args=-asan-kernel-mem-intrinsic-prefix=1",
+                "-C",
+                "llvm-args=-asan-mapping-scale=3",
+                "-C",
+                &format!("llvm-args=-asan-mapping-offset={}", offset),
+            ]);
+        }
     }
 
     match cmd.status() {
