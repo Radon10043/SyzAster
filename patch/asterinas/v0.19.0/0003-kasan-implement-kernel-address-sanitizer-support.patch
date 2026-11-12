@@ -567,7 +567,7 @@ index 6137208..611d8f9 100644
              let addr = paddr_to_vaddr(segment.paddr()) as *mut u8;
              // SAFETY: The newly allocated segment is guaranteed to be valid.
 diff --git a/ostd/src/mm/heap/mod.rs b/ostd/src/mm/heap/mod.rs
-index 58f15b9..f7d3a1f 100644
+index 58f15b9..8f972f4 100644
 --- a/ostd/src/mm/heap/mod.rs
 +++ b/ostd/src/mm/heap/mod.rs
 @@ -121,7 +121,12 @@ unsafe impl GlobalAlloc for AllocDispatch {
@@ -584,15 +584,16 @@ index 58f15b9..f7d3a1f 100644
      }
  
      unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-@@ -147,5 +152,8 @@ unsafe impl GlobalAlloc for AllocDispatch {
-                 required_slot,
+@@ -133,6 +138,9 @@ unsafe impl GlobalAlloc for AllocDispatch {
              );
-         }
-+
+         };
+ 
 +        #[cfg(feature = "kasan")]
 +        crate::kasan::free_hook(ptr as usize, required_slot.size());
-     }
- }
++
+         // SAFETY: The validity of the pointer is guaranteed by the caller. The
+         // size must match the size of the slot when it was allocated, since we
+         // require `slot_size_from_layout` to be idempotent.
 diff --git a/ostd/src/mm/heap/slot_list.rs b/ostd/src/mm/heap/slot_list.rs
 index 6eb5612..6683a89 100644
 --- a/ostd/src/mm/heap/slot_list.rs
