@@ -137,9 +137,53 @@ else
     git -C "$DEST" checkout --detach "$ASTERINAS_COMMIT"
 fi
 
+check_stacked_patches() {
+    local repo="$1"
+    shift
+    local patches=("$@")
+    local count=${#patches[@]}
+    PATCH_APPLIED_STATES=()
+    for ((i = 0; i < count; i++)); do
+        PATCH_APPLIED_STATES+=("0")
+    done
+    if [[ "$count" -eq 0 ]]; then
+        return 0
+    fi
+
+    local tmp_dir
+    tmp_dir=$(mktemp -d)
+    git -C "$tmp_dir" init -q
+
+    local rel
+    while IFS= read -r -d '' rel; do
+        if [[ "$rel" == *$'\t'* ]]; then
+            rel="${rel#*$'\t'}"
+            rel="${rel#*$'\t'}"
+        fi
+        if [[ -n "$rel" && "$rel" != /* && "$rel" != *..* && -e "$repo/$rel" && ! -e "$tmp_dir/$rel" ]]; then
+            mkdir -p "$tmp_dir/$(dirname "$rel")"
+            cp -a "$repo/$rel" "$tmp_dir/$rel"
+        fi
+    done < <(git apply --numstat -z "${patches[@]}" 2>/dev/null || true)
+
+    for ((i = count - 1; i >= 0; i--)); do
+        if git -C "$tmp_dir" apply --reverse --check "${patches[$i]}" >/dev/null 2>&1; then
+            git -C "$tmp_dir" apply --reverse --whitespace=nowarn "${patches[$i]}" >/dev/null 2>&1 || true
+            PATCH_APPLIED_STATES[$i]="1"
+        fi
+    done
+
+    rm -rf "$tmp_dir"
+}
+
 if [[ "$APPLY_PATCHES" -eq 1 ]]; then
-    for patch_file in "$SYZASTER"/patch/asterinas/"$ASTERINAS_VERSION"/*.patch; do
-        if ! git -C "$DEST" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+    shopt -s nullglob
+    target_patches=("$SYZASTER"/patch/asterinas/"$ASTERINAS_VERSION"/*.patch)
+    shopt -u nullglob
+    check_stacked_patches "$DEST" "${target_patches[@]}"
+    for ((i = 0; i < ${#target_patches[@]}; i++)); do
+        patch_file="${target_patches[$i]}"
+        if [[ "${PATCH_APPLIED_STATES[$i]}" -eq 0 ]]; then
             echo "Applying $(basename "$patch_file") ..."
             git -C "$DEST" apply "$patch_file"
         else
