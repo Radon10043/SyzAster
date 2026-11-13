@@ -5,8 +5,10 @@ use super::theme::{self, icons, st};
 use super::ui::{self, Dialog, Input, InputKind, Item, ItemKind, Level, ListState};
 use super::util::{self, Settings};
 use super::{rel, status, Action, After, Confirmed, Field, Job};
+use crate::pkg::TempDir;
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Default)]
@@ -80,6 +82,111 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     } else {
         None
     }
+}
+
+fn touched_paths(patches: &[PathBuf]) -> Option<BTreeSet<String>> {
+    let out = Command::new("git")
+        .args(["apply", "--numstat", "-z"])
+        .args(patches)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut paths = BTreeSet::new();
+    for tok in out.stdout.split(|&b| b == 0) {
+        let Ok(s) = std::str::from_utf8(tok) else {
+            continue;
+        };
+        let rel = if s.contains('\t') {
+            let mut parts = s.splitn(3, '\t');
+            let _ = parts.next();
+            let _ = parts.next();
+            parts.next().unwrap_or("")
+        } else {
+            s
+        };
+        if !rel.is_empty()
+            && Path::new(rel)
+                .components()
+                .all(|c| matches!(c, Component::Normal(_)))
+        {
+            paths.insert(rel.to_string());
+        }
+    }
+    Some(paths)
+}
+
+fn copy_rel_entry(src_root: &Path, dst_root: &Path, rel: &str) {
+    let from = src_root.join(rel);
+    let Ok(meta) = fs::symlink_metadata(&from) else {
+        return;
+    };
+    let to = dst_root.join(rel);
+    if let Some(parent) = to.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if meta.file_type().is_symlink() {
+        #[cfg(unix)]
+        if let Ok(target) = fs::read_link(&from) {
+            let _ = std::os::unix::fs::symlink(target, &to);
+        }
+    } else if meta.is_file() {
+        let _ = fs::copy(&from, &to);
+    }
+}
+
+/// Checks a sorted patch series in reverse order on an isolated scratch copy
+/// so earlier patches remain verifiable when later patches touch the same lines.
+fn check_patches(src: &Path, patches: &[PathBuf]) -> Vec<Option<bool>> {
+    if patches.is_empty() {
+        return Vec::new();
+    }
+    let abs_patches: Vec<PathBuf> = patches
+        .iter()
+        .map(|p| {
+            if p.is_absolute() {
+                p.clone()
+            } else {
+                fs::canonicalize(p).unwrap_or_else(|_| p.clone())
+            }
+        })
+        .collect();
+    let fallback = || {
+        abs_patches
+            .iter()
+            .map(|p| {
+                let p = p.to_string_lossy().to_string();
+                Some(git(src, &["apply", "--reverse", "--check", &p]).is_some())
+            })
+            .collect()
+    };
+    let Some(paths) = touched_paths(&abs_patches) else {
+        return fallback();
+    };
+    let Ok(tmp) = TempDir::new("syzaster-patch-check-") else {
+        return fallback();
+    };
+    if git(tmp.path(), &["init", "-q"]).is_none() {
+        return fallback();
+    }
+    for rel in &paths {
+        copy_rel_entry(src, tmp.path(), rel);
+    }
+    let mut applied = vec![Some(false); abs_patches.len()];
+    for (idx, p) in abs_patches.iter().enumerate().rev() {
+        let p_str = p.to_string_lossy().to_string();
+        if git(tmp.path(), &["apply", "--reverse", "--check", &p_str]).is_some() {
+            let _ = git(
+                tmp.path(),
+                &["apply", "--reverse", "--whitespace=nowarn", &p_str],
+            );
+            applied[idx] = Some(true);
+        }
+    }
+    applied
 }
 
 impl KernelTab {
@@ -178,18 +285,17 @@ impl KernelTab {
             })
             .unwrap_or_default();
         patches.sort();
-        for p in patches {
+        let states = if s.is_git {
+            check_patches(&src, &patches)
+        } else {
+            vec![None; patches.len()]
+        };
+        for (p, applied) in patches.into_iter().zip(states) {
             let name = p
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            let applied = if s.is_git {
-                let p = p.to_string_lossy().to_string();
-                Some(git(&src, &["apply", "--reverse", "--check", &p]).is_some())
-            } else {
-                None
-            };
             s.patches.push((name, applied));
         }
         let img = self.image_dir();
@@ -765,5 +871,70 @@ mod tests {
         assert_eq!(toml_value(t, "kcov"), Some("1".to_string()));
         assert_eq!(toml_value(t, "kasan"), Some("1".to_string()));
         assert_eq!(toml_value(t, "missing"), None);
+    }
+
+    #[test]
+    fn checks_stacked_patches_with_overlapping_hunks() {
+        let work = TempDir::new("syzaster-stacked-patches-").unwrap();
+        let repo = work.path().join("repo");
+        let pdir = work.path().join("patches");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&pdir).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+
+        run_git(&["init", "-q"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        run_git(&["config", "user.name", "Test"]);
+        fs::write(repo.join("Makefile"), "BASE = 0\n").unwrap();
+        run_git(&["add", "Makefile"]);
+        run_git(&["commit", "-q", "-m", "base"]);
+
+        fs::write(repo.join("other.txt"), "one\n").unwrap();
+        run_git(&["add", "other.txt"]);
+        let p1 = pdir.join("0001-first.patch");
+        fs::write(&p1, run_git(&["diff", "--cached"])).unwrap();
+        run_git(&["commit", "-q", "-m", "p1"]);
+
+        fs::write(repo.join("Makefile"), "BASE = 0\nKCOV = 1\n").unwrap();
+        fs::write(repo.join("wrapper.sh"), "#!/bin/sh\necho kcov\n").unwrap();
+        run_git(&["add", "Makefile", "wrapper.sh"]);
+        let p2 = pdir.join("0002-second.patch");
+        fs::write(&p2, run_git(&["diff", "--cached"])).unwrap();
+        run_git(&["commit", "-q", "-m", "p2"]);
+
+        fs::write(repo.join("Makefile"), "BASE = 0\nKCOV = 1\nKASAN = 1\n").unwrap();
+        fs::write(repo.join("wrapper.sh"), "#!/bin/sh\necho kcov+kasan\n").unwrap();
+        run_git(&["add", "Makefile", "wrapper.sh"]);
+        let p3 = pdir.join("0003-third.patch");
+        fs::write(&p3, run_git(&["diff", "--cached"])).unwrap();
+
+        // Simulate HEAD at base with p1 + p2 + p3 applied in working tree.
+        run_git(&["reset", "-q", "--soft", "HEAD~2"]);
+        run_git(&["reset", "-q", "HEAD"]);
+
+        let patches = vec![p1, p2, p3];
+        assert_eq!(
+            check_patches(&repo, &patches),
+            vec![Some(true), Some(true), Some(true)]
+        );
+        // Source working tree must remain untouched.
+        assert_eq!(
+            fs::read_to_string(repo.join("wrapper.sh")).unwrap(),
+            "#!/bin/sh\necho kcov+kasan\n"
+        );
     }
 }
