@@ -49,10 +49,16 @@ if [[ -z "$REPRO_SH_CONFIG_PATH" ]]; then
     exit 1
 fi
 
-mapfile -t LOGS < <(jq -r .logs[] "$REPRO_SH_CONFIG_PATH")
-mapfile -t DONE < <(jq -r .done[] "$REPRO_SH_CONFIG_PATH")
+mapfile -t LOGS < <(jq -r '.logs[]' "$REPRO_SH_CONFIG_PATH")
+SYZKALLER_CONFIG_PATH=$(jq -r '.config' "$REPRO_SH_CONFIG_PATH")
+SYZKALLER=$(jq -r '.syzkaller' "$SYZKALLER_CONFIG_PATH")
 for LOG in "${LOGS[@]}"; do
-    if [[ " ${DONE[*]} " == *" $LOG "* ]]; then
+    LOG_NAME=$(basename "$LOG")
+    LOG_DIR=$(dirname "$LOG")
+    LOG_HASH=$(basename "$LOG_DIR")
+    WORKDIR="$(dirname "$(dirname "$LOG_DIR")")/repro/$LOG_HASH/$LOG_NAME"
+
+    if [[ -f "$WORKDIR/.done" ]]; then
         echo "skip repro for $LOG since it's already done"
         continue
     fi
@@ -63,20 +69,15 @@ for LOG in "${LOGS[@]}"; do
         REPRO_JOBS=$(pgrep -c syz-repro || true)
     done
 
-    LOG_NAME=$(basename "$LOG")
-    LOG_DIR=$(dirname "$LOG")
-    LOG_HASH=$(basename "$LOG_DIR")
-
     echo "reproducing $LOG ..."
-    WORKDIR=$(dirname "$(dirname "$LOG_DIR")")/repro/$LOG_HASH/$LOG_NAME
-    SYZKALLER_CONFIG_PATH=$(jq -r .config "$REPRO_SH_CONFIG_PATH")
-    SYZKALLER=$(jq -r .syzkaller "$SYZKALLER_CONFIG_PATH")
     mkdir -p "$WORKDIR"
-    jq ".vm.count = 1" "$SYZKALLER_CONFIG_PATH" >"$WORKDIR/repro.cfg"
-    nohup "$SYZKALLER/bin/syz-repro" \
-        -config="$WORKDIR/repro.cfg" \
-        -output="$WORKDIR/repro.syz" \
-        -crepro="$WORKDIR/repro.c" "$LOG" >"$WORKDIR/repro.log" 2>&1 &
+    jq '.vm.count = 1 | .workdir = "/tmp"' "$SYZKALLER_CONFIG_PATH" >"$WORKDIR/repro.cfg"
+    nohup bash -c '
+        "$1/bin/syz-repro" \
+            -config="$2/repro.cfg" \
+            -output="$2/repro.syz" \
+            -crepro="$2/repro.c" "$3" >"$2/repro.log" 2>&1 && touch "$2/.done"
+    ' _ "$SYZKALLER" "$WORKDIR" "$LOG" >/dev/null 2>&1 &
 done
 
 REPRO_JOBS=$(pgrep -c syz-repro || true)
